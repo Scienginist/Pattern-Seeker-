@@ -1,0 +1,533 @@
+/* Pattern Seeker 계산·파싱 모듈 (순수 함수).
+ * 모든 계산 결과에는 사용한 식(formula)과 입력값을 함께 남긴다.
+ * 값이 없으면 null 을 돌려준다. 0 으로 채우지 않는다.
+ */
+(function (global) {
+  'use strict';
+  const C = {};
+
+  // ------------------------------------------------------------ 숫자·표
+  C.num = function (s) {
+    if (s === null || s === undefined) return NaN;
+    if (typeof s === 'number') return s;
+    let t = String(s).trim().replace(/−/g, '-').replace(/[\s%]+$/, '');
+    if (t === '' || t === '-' || /^n\.?d\.?$/i.test(t) || /^nd$/i.test(t)) return NaN;
+    if (/^-?\d+,\d+$/.test(t)) t = t.replace(',', '.'); // 1,23 -> 1.23 (소수점 콤마)
+    t = t.replace(/^</, '');
+    const v = Number(t);
+    return Number.isFinite(v) ? v : NaN;
+  };
+  C.isNum = (v) => typeof v === 'number' && Number.isFinite(v);
+
+  C.parseTable = function (text) {
+    const lines = String(text || '').split(/\r?\n/).map((l) => l.replace(/\s+$/, '')).filter((l) => l.trim() !== '');
+    if (!lines.length) return { headers: [], rows: [], delimiter: null };
+    const sample = lines.slice(0, 20).join('\n');
+    let delim;
+    if (sample.includes('\t')) delim = '\t';
+    else if ((sample.match(/;/g) || []).length >= lines.slice(0, 20).length) delim = ';';
+    else if ((sample.match(/,/g) || []).length >= lines.slice(0, 20).length && !/\d,\d+\s/.test(sample)) delim = ',';
+    else delim = /\s+/;
+    const split = (l) => (typeof delim === 'string' ? l.split(delim) : l.trim().split(delim)).map((c) => c.trim());
+    const all = lines.map(split);
+    // 숫자 행이 시작되기 전 마지막 텍스트 행을 헤더로 본다.
+    let firstNum = all.findIndex((r) => r.filter((c) => C.isNum(C.num(c))).length >= Math.max(1, Math.ceil(r.length / 2)));
+    if (firstNum < 0) firstNum = all.length;
+    const headers = firstNum > 0 ? all[firstNum - 1] : [];
+    const rows = all.slice(firstNum);
+    const ncol = Math.max(headers.length, ...rows.map((r) => r.length), 0);
+    while (headers.length < ncol) headers.push(`열 ${headers.length + 1}`);
+    return { headers, rows, delimiter: typeof delim === 'string' ? delim : 'space', preamble: all.slice(0, Math.max(0, firstNum - 1)).map((r) => r.join(' ')) };
+  };
+
+  C.column = function (table, idx) {
+    return table.rows.map((r) => C.num(r[idx]));
+  };
+
+  C.guessCol = function (headers, patterns, exclude) {
+    exclude = exclude || [];
+    for (const p of patterns) {
+      const i = headers.findIndex((h, k) => !exclude.includes(k) && p.test(String(h).toLowerCase()));
+      if (i >= 0) return i;
+    }
+    return -1;
+  };
+
+  // 숫자만 있는 열 두 개 이상을 XY 로 읽는다
+  C.parseXY = function (text, xi, yi) {
+    const t = C.parseTable(text);
+    const nc = t.headers.length;
+    xi = xi === undefined ? 0 : xi;
+    yi = yi === undefined ? Math.min(1, nc - 1) : yi;
+    const x = [], y = [];
+    for (const r of t.rows) {
+      const a = C.num(r[xi]), b = C.num(r[yi]);
+      if (C.isNum(a) && C.isNum(b)) { x.push(a); y.push(b); }
+    }
+    return { x, y, headers: t.headers, table: t };
+  };
+
+  // ------------------------------------------------------------ 통계
+  C.linreg = function (xs, ys) {
+    const pts = [];
+    for (let i = 0; i < xs.length; i++) if (C.isNum(xs[i]) && C.isNum(ys[i])) pts.push([xs[i], ys[i]]);
+    const n = pts.length;
+    if (n < 2) return null;
+    let sx = 0, sy = 0;
+    for (const [x, y] of pts) { sx += x; sy += y; }
+    const mx = sx / n, my = sy / n;
+    let sxx = 0, sxy = 0, syy = 0;
+    for (const [x, y] of pts) { sxx += (x - mx) ** 2; sxy += (x - mx) * (y - my); syy += (y - my) ** 2; }
+    if (sxx === 0) return null;
+    const slope = sxy / sxx, intercept = my - slope * mx;
+    const r2 = syy === 0 ? 1 : (sxy * sxy) / (sxx * syy);
+    let sse = 0;
+    for (const [x, y] of pts) sse += (y - (slope * x + intercept)) ** 2;
+    const seSlope = n > 2 ? Math.sqrt(sse / (n - 2) / sxx) : null;
+    return { slope, intercept, r2, n, seSlope, r: sxy / Math.sqrt(sxx * syy || 1) };
+  };
+
+  C.pearson = function (xs, ys) {
+    const lr = C.linreg(xs, ys);
+    if (!lr) return null;
+    return { r: lr.r, n: lr.n, slope: lr.slope, intercept: lr.intercept };
+  };
+
+  C.spearman = function (xs, ys) {
+    const pts = [];
+    for (let i = 0; i < xs.length; i++) if (C.isNum(xs[i]) && C.isNum(ys[i])) pts.push([xs[i], ys[i]]);
+    if (pts.length < 3) return null;
+    const rank = (arr) => {
+      const idx = arr.map((v, i) => [v, i]).sort((a, b) => a[0] - b[0]);
+      const r = new Array(arr.length);
+      for (let i = 0; i < idx.length;) {
+        let j = i;
+        while (j + 1 < idx.length && idx[j + 1][0] === idx[i][0]) j++;
+        for (let k = i; k <= j; k++) r[idx[k][1]] = (i + j) / 2 + 1;
+        i = j + 1;
+      }
+      return r;
+    };
+    const lr = C.linreg(rank(pts.map((p) => p[0])), rank(pts.map((p) => p[1])));
+    return lr ? lr.r : null;
+  };
+
+  C.interp = function (xs, ys, x0) {
+    // 첫 번째로 x0 를 지나는 구간에서 선형 보간
+    for (let i = 1; i < xs.length; i++) {
+      const a = xs[i - 1], b = xs[i];
+      if ((a - x0) * (b - x0) <= 0 && a !== b) {
+        return ys[i - 1] + (ys[i] - ys[i - 1]) * (x0 - a) / (b - a);
+      }
+    }
+    return null;
+  };
+
+  // ------------------------------------------------------------ 스플라인 (자연 3차)
+  C.naturalSpline = function (pts) {
+    const p = pts.slice().sort((a, b) => a[0] - b[0]).filter((v, i, arr) => i === 0 || v[0] !== arr[i - 1][0]);
+    const n = p.length;
+    if (n === 0) return () => 0;
+    if (n === 1) return () => p[0][1];
+    const x = p.map((v) => v[0]), y = p.map((v) => v[1]);
+    if (n === 2) {
+      const s = (y[1] - y[0]) / (x[1] - x[0]);
+      return (t) => y[0] + s * (t - x[0]);
+    }
+    const h = [], al = [], l = [1], mu = [0], z = [0];
+    for (let i = 0; i < n - 1; i++) h.push(x[i + 1] - x[i]);
+    for (let i = 1; i < n - 1; i++) al[i] = (3 / h[i]) * (y[i + 1] - y[i]) - (3 / h[i - 1]) * (y[i] - y[i - 1]);
+    for (let i = 1; i < n - 1; i++) {
+      l[i] = 2 * (x[i + 1] - x[i - 1]) - h[i - 1] * mu[i - 1];
+      mu[i] = h[i] / l[i];
+      z[i] = (al[i] - h[i - 1] * z[i - 1]) / l[i];
+    }
+    const c = new Array(n).fill(0), b = [], d = [];
+    for (let j = n - 2; j >= 0; j--) {
+      c[j] = (j === 0 ? 0 : z[j] - mu[j] * c[j + 1]);
+      b[j] = (y[j + 1] - y[j]) / h[j] - (h[j] * (c[j + 1] + 2 * c[j])) / 3;
+      d[j] = (c[j + 1] - c[j]) / (3 * h[j]);
+    }
+    // 자연 경계: c[0]=c[n-1]=0
+    return function (t) {
+      if (t <= x[0]) return y[0] + b[0] * (t - x[0]);
+      if (t >= x[n - 1]) {
+        const j = n - 2, dx = x[n - 1] - x[j];
+        const slope = b[j] + 2 * c[j] * dx + 3 * d[j] * dx * dx;
+        return y[n - 1] + slope * (t - x[n - 1]);
+      }
+      let lo = 0, hi = n - 1;
+      while (hi - lo > 1) { const m = (lo + hi) >> 1; if (x[m] > t) hi = m; else lo = m; }
+      const dx = t - x[lo];
+      return y[lo] + b[lo] * dx + c[lo] * dx * dx + d[lo] * dx * dx * dx;
+    };
+  };
+
+  C.maxOf = (arr) => arr.reduce((m, v) => (C.isNum(v) && v > m ? v : m), -Infinity);
+  C.minOf = (arr) => arr.reduce((m, v) => (C.isNum(v) && v < m ? v : m), Infinity);
+
+  // ------------------------------------------------------------ XRD
+  C.XRD_GS_FORMULA = 'GS(nm) = K × λ / (radians(FWHM) × cos(radians(2θ/2)))';
+  C.XRD_SI_FORMULA = 'SI = 피크 적분 면적 / FWHM';
+  C.rad = (deg) => (deg * Math.PI) / 180;
+  C.scherrer = function (fwhmDeg, twoThetaDeg, K, lambdaNm) {
+    if (!C.isNum(fwhmDeg) || !C.isNum(twoThetaDeg) || fwhmDeg <= 0) return null;
+    return (K * lambdaNm) / (C.rad(fwhmDeg) * Math.cos(C.rad(twoThetaDeg / 2)));
+  };
+  C.sharpness = (area, fwhm) => (C.isNum(area) && C.isNum(fwhm) && fwhm > 0 ? area / fwhm : null);
+
+  C.XRD_DEFAULT_LABELS = ['(110)', '(101)', '', ''];
+
+  C.guessXrdColumns = function (headers) {
+    const h = headers.map((x) => String(x).toLowerCase());
+    const used = [];
+    const pick = (pats) => { const i = C.guessCol(h, pats, used); if (i >= 0) used.push(i); return i; };
+    const label = pick([/hkl/, /^label/, /miller/]);
+    const area = pick([/area\s*intg(?!p)/, /^area$/, /area(?!.*%)/, /^a$/]);
+    const fwhm = pick([/fwhm/]);
+    const center = pick([/center|centre/, /^xc$/, /2\s*(θ|theta)/, /pos/]);
+    const gs = pick([/^gs|grain|crystal|size/]);
+    const w = fwhm < 0 ? C.guessCol(h, [/^w$/], used) : -1;
+    return { label, area, fwhm, center, gs, w };
+  };
+
+  C.computeXrd = function (peaks, K, lambda) {
+    const out = peaks.map((p) => {
+      const si = C.sharpness(p.area, p.fwhm);
+      const gs = C.scherrer(p.fwhm, p.center, K, lambda);
+      return { label: p.label, si, gs_nm: gs };
+    });
+    const metrics = {};
+    const set = (key, value, unit, formula, inputs) => { if (C.isNum(value)) metrics[key] = { value, unit, formula, inputs }; };
+    peaks.forEach((p, i) => {
+      const lab = (p.label || '').replace(/[()\s]/g, '');
+      if (!['110', '101'].includes(lab)) return;
+      set('gs_' + lab, out[i].gs_nm, 'nm', C.XRD_GS_FORMULA, { FWHM: p.fwhm, '2θ': p.center, K, 'λ(nm)': lambda });
+      set('si_' + lab, out[i].si, '', C.XRD_SI_FORMULA, { area: p.area, FWHM: p.fwhm });
+      set('fwhm_' + lab, p.fwhm, '°', '입력값', {});
+      set('center_' + lab, p.center, '°', '입력값', {});
+    });
+    return { peaks: out, metrics, constants: { K, lambda_nm: lambda }, formulas: { gs: C.XRD_GS_FORMULA, si: C.XRD_SI_FORMULA } };
+  };
+
+  // ------------------------------------------------------------ BET
+  const BET_PATTERNS = [
+    ['bet_ssa', /BET\s+Surface\s+Area[^0-9\n]*?([\d.,]+)\s*(m.?\s*\/\s*g|m2\/g|m²\/g)?/i],
+    ['tplot_micro_area', /t-?\s*Plot\s+Micropore\s+Area[^0-9\n]*?([\d.,]+)/i],
+    ['tplot_ext_area', /t-?\s*Plot\s+External\s+Surface\s+Area[^0-9\n]*?([\d.,]+)/i],
+    ['pore_volume', /total\s+pore\s+volume[\s\S]{0,250}?([\d.]+)\s*cm(?:³|3|\^3)\s*\/\s*g/i],
+    ['pore_size', /(?:Adsorption|Desorption)?\s*average\s+pore\s+(?:diameter|width)[^\n]*?:\s*([\d.,]+)\s*(Å|nm|A\b)?/i],
+  ];
+  C.parseBetReport = function (text) {
+    const out = {};
+    for (const [key, rx] of BET_PATTERNS) {
+      const m = String(text || '').match(rx);
+      if (!m) continue;
+      let v = C.num(m[1].replace(/,(?=\d{3}\b)/g, ''));
+      if (!C.isNum(v)) continue;
+      const entry = { value: v, unit: '', source: 'extracted', evidence: m[0].trim().slice(0, 160) };
+      if (key === 'pore_size') {
+        const u = (m[2] || '').trim();
+        if (u === 'Å' || u === 'A' || /Å/.test(m[0])) { entry.value = v / 10; entry.original = { value: v, unit: 'Å' }; entry.conversion = 'nm = Å / 10'; }
+        entry.unit = 'nm';
+      } else if (key === 'pore_volume') entry.unit = 'cm³/g';
+      else entry.unit = 'm²/g';
+      out[key] = entry;
+    }
+    return out;
+  };
+
+  // 등온선 데이터: p/p0, 흡착량(cm³/g STP)
+  C.BET_SSA_FACTOR = 6.02214076e23 * 0.162e-18 / 22414; // m²/cm³(STP)  ≈ 4.3525
+  C.BET_FORMULA = '1/[Q(p0/p − 1)] = (C−1)/(Qm·C)·(p/p0) + 1/(Qm·C);  Qm = 1/(기울기+절편), C = 1 + 기울기/절편, S = Qm × N_A × σ(N₂, 0.162 nm²) / 22414';
+  C.betRanges = function (pp, q, opt) {
+    opt = Object.assign({ pmin: 0.01, pmax: 0.35, minPts: 4, r2min: 0.995 }, opt || {});
+    const pts = [];
+    for (let i = 0; i < pp.length; i++) {
+      if (C.isNum(pp[i]) && C.isNum(q[i]) && pp[i] > 0 && pp[i] < 1 && q[i] > 0) pts.push({ i, p: pp[i], q: q[i] });
+    }
+    // 흡착 분지만: p/p0 가 증가하는 첫 구간
+    const ads = [];
+    for (const pt of pts) { if (ads.length && pt.p < ads[ads.length - 1].p) break; ads.push(pt); }
+    const inr = ads.filter((pt) => pt.p >= opt.pmin && pt.p <= opt.pmax);
+    // Rouquerol 기준 1: Q(1−p/p0) 가 증가하는 마지막 점까지만 사용 가능
+    const rq = ads.map((pt) => pt.q * (1 - pt.p));
+    let rqMaxP = Infinity;
+    for (let k = 1; k < ads.length; k++) if (rq[k] < rq[k - 1]) { rqMaxP = ads[k - 1].p; break; }
+    const cands = [];
+    for (let a = 0; a < inr.length; a++) {
+      for (let b = a + opt.minPts - 1; b < inr.length; b++) {
+        const w = inr.slice(a, b + 1);
+        const xs = w.map((v) => v.p), ys = w.map((v) => 1 / (v.q * (1 / v.p - 1)));
+        const lr = C.linreg(xs, ys);
+        if (!lr) continue;
+        const s = lr.slope, ic = lr.intercept;
+        const cval = ic !== 0 ? 1 + s / ic : null;
+        const qm = s + ic !== 0 ? 1 / (s + ic) : null;
+        const ssa = qm !== null ? qm * C.BET_SSA_FACTOR : null;
+        const xm = cval > 0 ? 1 / (Math.sqrt(cval) + 1) : null;
+        const reasons = [];
+        if (lr.r2 < opt.r2min) reasons.push(`R² ${lr.r2.toFixed(4)} < ${opt.r2min}`);
+        if (!(ic > 0)) reasons.push('절편 ≤ 0 (C 음수/무한대)');
+        if (!(cval > 0)) reasons.push('C ≤ 0');
+        if (w[w.length - 1].p > rqMaxP + 1e-9) reasons.push('Rouquerol 1: Q(1−p/p0) 감소 구간 포함');
+        if (xm !== null && (xm < w[0].p || xm > w[w.length - 1].p)) reasons.push('Rouquerol 3: 단분자층 p/p0 가 구간 밖');
+        cands.push({ from: w[0].p, to: w[w.length - 1].p, idx: w.map((v) => v.i), n: w.length, r2: lr.r2, slope: s, intercept: ic,
+          C: cval, qm, ssa, xm, eligible: reasons.length === 0, reasons });
+      }
+    }
+    const eligible = cands.filter((c) => c.eligible);
+    // 기본 선택: 기준을 모두 만족하는 후보 중 R² 최고. 점 개수는 선택 기준으로 쓰지 않는다.
+    let best = null;
+    for (const c of eligible) if (!best || c.r2 > best.r2) best = c;
+    return { candidates: cands, eligible, selected: best, options: opt, adsorptionPoints: ads.length, rouquerolMaxP: rqMaxP };
+  };
+
+  // ------------------------------------------------------------ XRF
+  C.ATOMIC = { H: 1.008, B: 10.81, C: 12.011, N: 14.007, O: 15.999, F: 18.998, Na: 22.990, Mg: 24.305, Al: 26.982, Si: 28.085, P: 30.974,
+    S: 32.06, Cl: 35.45, K: 39.098, Ca: 40.078, Ti: 47.867, V: 50.942, Cr: 51.996, Mn: 54.938, Fe: 55.845, Co: 58.933, Ni: 58.693,
+    Cu: 63.546, Zn: 65.38, Zr: 91.224, Nb: 92.906, Mo: 95.95, Ru: 101.07, Rh: 102.91, Pd: 106.42, Ag: 107.87, Sn: 118.71, Sb: 121.76,
+    Ba: 137.33, Ce: 140.12, La: 138.91, Ta: 180.95, W: 183.84, Os: 190.23, Ir: 192.22, Pt: 195.08, Au: 196.97, Pb: 207.2, Bi: 208.98,
+    Br: 79.904, I: 126.90, Ga: 69.723, Ge: 72.63, Sr: 87.62, Y: 88.906, In: 114.82, Hf: 178.49, Re: 186.21, Sc: 44.956, Li: 6.94, Cs: 132.91, Rb: 85.468, Se: 78.971, As: 74.922, Te: 127.6 };
+
+  C.parseFormula = function (f) {
+    const m = String(f).match(/^([A-Z][a-z]?\d*)+$/);
+    if (!m) return null;
+    const out = {};
+    for (const [, el, n] of String(f).matchAll(/([A-Z][a-z]?)(\d*)/g)) {
+      if (!C.ATOMIC[el]) return null;
+      out[el] = (out[el] || 0) + (n ? Number(n) : 1);
+    }
+    return out;
+  };
+  C.massFraction = function (formula, el) {
+    const comp = C.parseFormula(formula);
+    if (!comp || !comp[el]) return null;
+    let tot = 0;
+    for (const [e, n] of Object.entries(comp)) tot += C.ATOMIC[e] * n;
+    return (C.ATOMIC[el] * comp[el]) / tot;
+  };
+
+  C.parseXrf = function (text) {
+    const rows = [];
+    const seen = new Set();
+    for (const line of String(text || '').split(/\r?\n/)) {
+      const toks = line.trim().split(/[\s\t,;|]+/).filter(Boolean);
+      for (let i = 0; i < toks.length - 1; i++) {
+        const comp = toks[i].replace(/[:]/g, '');
+        if (!C.parseFormula(comp)) continue;
+        // 성분 뒤 첫 숫자를 함량으로 사용
+        let val = NaN, unit = '';
+        for (let j = i + 1; j < Math.min(toks.length, i + 4); j++) {
+          const raw = toks[j];
+          const v = C.num(raw.replace(/(mass|wt)?%$/i, ''));
+          if (C.isNum(v)) {
+            val = v;
+            const u = (toks[j + 1] || '').toLowerCase();
+            unit = /ppm/.test(raw + u) ? 'ppm' : '%';
+            break;
+          }
+        }
+        if (C.isNum(val) && !seen.has(comp)) {
+          seen.add(comp);
+          rows.push({ component: comp, value: val, unit, line: line.trim().slice(0, 160), source: 'extracted' });
+        }
+        break;
+      }
+    }
+    return rows;
+  };
+
+  C.XRF_PURITY_FORMULA = '순도(%) = Σ(주성분 함량) / Σ(보고된 모든 성분 함량) × 100';
+  C.computeXrf = function (components, mainList, interest) {
+    const pct = components.filter((c) => C.isNum(c.value)).map((c) => ({ ...c, pct: c.unit === 'ppm' ? c.value / 1e4 : c.value }));
+    const total = pct.reduce((s, c) => s + c.pct, 0);
+    const mains = pct.filter((c) => mainList.includes(c.component));
+    const metrics = {};
+    if (mains.length && total > 0) {
+      const mainSum = mains.reduce((s, c) => s + c.pct, 0);
+      metrics.purity = { value: (mainSum / total) * 100, unit: '%', formula: C.XRF_PURITY_FORMULA,
+        inputs: { main: mains.map((c) => `${c.component}=${c.pct}`), total_reported: total } };
+    }
+    const impurities = {};
+    for (const el of interest) {
+      // 원소 그대로 보고되었거나, 산화물 등 화합물로 보고되면 원소 질량분율로 환산
+      const direct = pct.find((c) => c.component === el);
+      if (direct) {
+        impurities[el] = { value: direct.pct, unit: 'wt%', basis: `${el} 직접 보고값` };
+      } else {
+        const compd = pct.find((c) => C.parseFormula(c.component) && C.parseFormula(c.component)[el] && c.component !== el);
+        if (compd) {
+          const f = C.massFraction(compd.component, el);
+          impurities[el] = { value: compd.pct * f, unit: 'wt%', basis: `${compd.component} ${compd.pct} × ${f.toFixed(4)} (${el} 질량분율 환산)`, from: compd.component };
+        }
+      }
+      if (impurities[el]) metrics['imp_' + el] = { value: impurities[el].value, unit: 'wt%', formula: impurities[el].basis, inputs: {} };
+    }
+    return { metrics, total_reported: total, impurities, main_components: mainList, interest_elements: interest,
+      not_reported: interest.filter((el) => !impurities[el]) };
+  };
+
+  // ------------------------------------------------------------ PSA
+  C.SPAN_FORMULA = 'Span = (D90 − D10) / D50';
+  C.span = (d10, d50, d90) => (C.isNum(d10) && C.isNum(d50) && C.isNum(d90) && d50 > 0 ? (d90 - d10) / d50 : null);
+
+  // ------------------------------------------------------------ 스무딩
+  C.savgol = function (y, window) {
+    // Savitzky–Golay 2차(=3차) 스무딩 계수: c_i = 3(3m²+3m−1−5i²) / ((4m²−1)(2m+3))
+    window = Math.max(3, window | 0);
+    if (window % 2 === 0) window += 1;
+    const m = (window - 1) / 2;
+    const coef = [];
+    const den = (4 * m * m - 1) * (2 * m + 3);
+    for (let i = -m; i <= m; i++) coef.push((3 * (3 * m * m + 3 * m - 1 - 5 * i * i)) / den);
+    const n = y.length, out = new Array(n);
+    for (let k = 0; k < n; k++) {
+      if (k < m || k >= n - m) { out[k] = y[k]; continue; }
+      let s = 0, ok = true;
+      for (let i = -m; i <= m; i++) { const v = y[k + i]; if (!C.isNum(v)) { ok = false; break; } s += coef[i + m] * v; }
+      out[k] = ok ? s : y[k];
+    }
+    return out;
+  };
+  C.movingAverage = function (y, window) {
+    const h = Math.max(1, Math.floor(window / 2)), out = [];
+    for (let k = 0; k < y.length; k++) {
+      let s = 0, n = 0;
+      for (let i = Math.max(0, k - h); i <= Math.min(y.length - 1, k + h); i++) if (C.isNum(y[i])) { s += y[i]; n++; }
+      out.push(n ? s / n : NaN);
+    }
+    return out;
+  };
+
+  // ------------------------------------------------------------ TGA
+  C.computeTga = function (T, mass, opt) {
+    opt = Object.assign({ massUnit: '%', window: 21, method: 'savgol' }, opt || {});
+    const m0 = mass.find((v) => C.isNum(v));
+    const pct = opt.massUnit === '%' ? mass.slice() : mass.map((v) => (v / m0) * 100);
+    const dtg = new Array(T.length).fill(NaN);
+    for (let i = 1; i < T.length - 1; i++) {
+      const dT = T[i + 1] - T[i - 1];
+      if (Math.abs(dT) > 1e-9) dtg[i] = -(pct[i + 1] - pct[i - 1]) / dT;
+    }
+    // 등온 구간(dT≈0)의 NaN 은 이웃값 보간 없이 그대로 둔다
+    const sm = opt.method === 'none' ? dtg.slice() : opt.method === 'ma' ? C.movingAverage(dtg, opt.window) : C.savgol(dtg, opt.window);
+    return { massPct: pct, m0, dtgRaw: dtg, dtgSmooth: sm, smoothing: { method: opt.method, window: opt.window } };
+  };
+  C.TGA_WATER_FORMULA = '수분 함량(%) = [m(T1) − m(T2)] / m₀ × 100   (m₀: 첫 데이터점 질량)';
+  C.tgaLoss = function (T, massPct, t1, t2) {
+    const a = C.interp(T, massPct, t1), b = C.interp(T, massPct, t2);
+    const m0 = massPct.find((v) => C.isNum(v));
+    if (!C.isNum(a) || !C.isNum(b)) return null;
+    return { value: ((a - b) / m0) * 100, m_t1: a, m_t2: b, m0 };
+  };
+
+  // ------------------------------------------------------------ 전기화학
+  C.splitCycles = function (E, cycleCol) {
+    const n = E.length;
+    if (cycleCol && cycleCol.some((v) => C.isNum(v))) {
+      const groups = [];
+      let cur = null, curId = null;
+      for (let i = 0; i < n; i++) {
+        if (cycleCol[i] !== curId) { curId = cycleCol[i]; cur = { id: curId, start: i, end: i }; groups.push(cur); }
+        cur.end = i;
+      }
+      return { method: '데이터의 cycle 열', cycles: groups.map((g, k) => ({ no: k + 1, label: String(g.id), start: g.start, end: g.end })) };
+    }
+    const lo = C.minOf(E), hi = C.maxOf(E), range = hi - lo;
+    if (!(range > 0)) return { method: '분리 불가(전위 변화 없음)', cycles: [{ no: 1, start: 0, end: n - 1 }] };
+    const tol = range * 0.02;
+    // 방향 전환점(꼭짓점) 찾기 (히스테리시스 적용)
+    const vertices = [];
+    let dir = 0, ext = E[0], extI = 0;
+    for (let i = 1; i < n; i++) {
+      const v = E[i];
+      if (dir >= 0 && v > ext) { ext = v; extI = i; if (dir === 0 && v - E[0] > tol) dir = 1; }
+      else if (dir <= 0 && v < ext) { ext = v; extI = i; if (dir === 0 && E[0] - v > tol) dir = -1; }
+      if (dir === 1 && ext - v > tol) { vertices.push({ i: extI, type: 'max' }); dir = -1; ext = v; extI = i; }
+      else if (dir === -1 && v - ext > tol) { vertices.push({ i: extI, type: 'min' }); dir = 1; ext = v; extI = i; }
+    }
+    if (vertices.length < 2) return { method: '분리 불가(꼭짓점 부족) — 단일 곡선', cycles: [{ no: 1, start: 0, end: n - 1 }] };
+    const E0 = E[0];
+    const startAtVertex = Math.abs(E0 - lo) < tol * 2 || Math.abs(E0 - hi) < tol * 2;
+    const bounds = [0];
+    if (startAtVertex) {
+      const t = Math.abs(E0 - lo) < Math.abs(E0 - hi) ? 'min' : 'max';
+      for (const v of vertices) if (v.type === t) bounds.push(v.i);
+    } else {
+      const d0 = E[Math.min(n - 1, 5)] >= E0 ? 1 : -1;
+      let vSince = 0, vk = 0;
+      for (let i = 1; i < n; i++) {
+        while (vk < vertices.length && vertices[vk].i <= i) { vSince++; vk++; }
+        const crossed = d0 > 0 ? E[i - 1] < E0 && E[i] >= E0 : E[i - 1] > E0 && E[i] <= E0;
+        if (crossed && vSince >= 2) { bounds.push(i); vSince = 0; }
+      }
+    }
+    const cycles = [];
+    for (let k = 0; k < bounds.length; k++) {
+      const s = bounds[k], e = k + 1 < bounds.length ? bounds[k + 1] - 1 : n - 1;
+      if (e - s >= 3) cycles.push({ no: cycles.length + 1, start: s, end: e });
+    }
+    const last = cycles[cycles.length - 1];
+    if (last) {
+      const seg = E.slice(last.start, last.end + 1);
+      last.partial = C.maxOf(seg) - C.minOf(seg) < range * 0.9;
+    }
+    return { method: startAtVertex ? '전위 꼭짓점 기준 자동 분리' : '시작 전위 재통과 기준 자동 분리', cycles, vertices: vertices.length };
+  };
+
+  // 한 사이클에서 선택 전위의 산화(정방향)·환원(역방향) 전류
+  C.currentsAt = function (E, I, start, end, E0) {
+    let ia = null, ic = null;
+    for (let i = start + 1; i <= end; i++) {
+      const a = E[i - 1], b = E[i];
+      if ((a - E0) * (b - E0) > 0 || a === b) continue;
+      const v = I[i - 1] + (I[i] - I[i - 1]) * (E0 - a) / (b - a);
+      if (b > a && ia === null) ia = v;
+      if (b < a && ic === null) ic = v;
+    }
+    return { ia, ic };
+  };
+
+  C.ECSA_FORMULA = 'Cdl(mF) = d[(i_a − i_c)/2] / d(scan rate) (mA ÷ V/s);  ECSA(cm²) = Cdl / Cs;  ECSA/질량 = ECSA / 로딩(mg)';
+  C.computeEcsa = function (points, cs, loadingMg) {
+    // points: [{rate (V/s), ia (mA), ic (mA)}]
+    const ok = points.filter((p) => C.isNum(p.rate) && C.isNum(p.ia) && C.isNum(p.ic));
+    const half = ok.map((p) => (p.ia - p.ic) / 2);
+    const lr = C.linreg(ok.map((p) => p.rate), half);
+    const lrA = C.linreg(ok.map((p) => p.rate), ok.map((p) => p.ia));
+    const lrC = C.linreg(ok.map((p) => p.rate), ok.map((p) => -p.ic));
+    if (!lr) return { error: 'scan rate 가 다른 측정이 2개 이상 필요합니다', n: ok.length };
+    const cdl = lr.slope;
+    const res = { cdl_mF: cdl, r2: lr.r2, n: ok.length, anodic_slope: lrA && lrA.slope, cathodic_slope: lrC && lrC.slope,
+      intercept: lr.intercept, points: ok.map((p, k) => ({ ...p, half: half[k] })) };
+    if (C.isNum(cs) && cs > 0) res.ecsa_cm2 = cdl / cs;
+    if (C.isNum(res.ecsa_cm2) && C.isNum(loadingMg) && loadingMg > 0) res.ecsa_per_mg = res.ecsa_cm2 / loadingMg;
+    return res;
+  };
+
+  // ------------------------------------------------------------ 표시
+  C.fmt = function (v, d) {
+    if (v === null || v === undefined || v === '' || (typeof v === 'number' && !Number.isFinite(v))) return '—';
+    if (typeof v !== 'number') { const n = Number(v); if (!Number.isFinite(n)) return String(v); v = n; }
+    d = d === undefined ? 2 : d;
+    if (v !== 0 && Math.abs(v) < Math.pow(10, -d) * 5) return v.toExponential(2);
+    return v.toLocaleString('ko-KR', { minimumFractionDigits: d, maximumFractionDigits: d });
+  };
+
+  C.dateCandidates = function (text) {
+    const out = [];
+    const rx = [/(20\d{2})[-./년 ]\s?(\d{1,2})[-./월 ]\s?(\d{1,2})/g];
+    for (const r of rx) for (const m of String(text || '').matchAll(r)) {
+      const y = +m[1], mo = +m[2], d = +m[3];
+      if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
+        const iso = `${y}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+        if (!out.includes(iso)) out.push(iso);
+      }
+    }
+    return out;
+  };
+
+  global.PSCalc = C;
+  if (typeof module !== 'undefined') module.exports = C;
+})(typeof window !== 'undefined' ? window : globalThis);

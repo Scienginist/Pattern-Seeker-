@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pattern Seeker</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="nav-hist">
+    <button id="nav-back" title="뒤로 (Alt+←)" aria-label="뒤로">←</button>
+    <button id="nav-fwd" title="앞으로 (Alt+→)" aria-label="앞으로">→</button>
+  </div>
+  <a class="brand" href="#/samples">Pattern Seeker</a>
+  <nav id="mainnav">
+    <a href="#/samples" data-sec="samples">샘플</a>
+    <a href="#/compare" data-sec="compare">비교</a>
+    <a href="#/patterns" data-sec="patterns">패턴 탐색</a>
+    <a href="#/series" data-sec="series">시리즈</a>
+    <a href="#/settings" data-sec="settings">설정·백업</a>
+  </nav>
+  <div id="crumb" class="crumb"></div>
+</header>
+<main id="view" tabindex="-1"></main>
+<div id="toasts" aria-live="polite"></div>
+<script src="calc.js"></script>
+<script src="chart.js"></script>
+<script src="app.js"></script>
+<script src="tools.js"></script>
+<script src="views.js"></script>
+</body>
+</html>
