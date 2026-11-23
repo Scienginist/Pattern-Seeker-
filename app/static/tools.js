@@ -516,6 +516,7 @@
       } };
     }
     function redraw(keepZoom) {
+      if (typeof renderFit === 'function' && fitStatus) setTimeout(() => renderFit(), 0);
       ptsList.innerHTML = '';
       if (!xy) { chartBox.innerHTML = ''; chartBox.appendChild(h('div', { class: 'muted small' }, 'XY 데이터가 없습니다.')); return; }
       if (!chart) chart = PSChart.render(chartBox, spec()); else chart.redraw(spec(), keepZoom);
@@ -529,8 +530,110 @@
       const p = C.parseXY(text);
       if (p.x.length < 10) throw new Error('2열 숫자 데이터를 찾지 못했습니다');
       xy = { name: 'XRD XY', columns: ['2θ (°)', '강도'], data: [p.x, p.y], meta: { file_name: meta.file_name || null, background_points: [], background_method: '자연 3차 스플라인 (사용자 지정 배경점)' } };
-      bgPts = []; undo.length = 0; chart = null; ctx.applyFileDates(meta); ctx.markDirty(); redraw();
+      bgPts = []; undo.length = 0; chart = null; fit = null; fitPeaks = []; ctx.applyFileDates(meta); ctx.markDirty(); redraw(); renderFit();
     } });
+
+    // --- Gaussian 피팅 (원본 XY 는 그대로, 결과는 xy.meta.fit 에 “피팅 추정”으로 저장)
+    const FIT_COLORS = ['#e67e22', '#16a085', '#8e44ad', '#c0392b', '#2c3e50', '#d35400', '#27ae60', '#7f8c8d', '#2980b9', '#f39c12'];
+    let fit = xy && xy.meta && xy.meta.fit ? JSON.parse(JSON.stringify(xy.meta.fit)) : null;
+    let fitPeaks = fit ? fit.peaks.map((p) => Object.assign({ lock: {} }, p)) : [];
+    const fitBox = h('div'), fitChart = h('div'), fitResid = h('div'), fitStatus = h('div');
+    const nIn = numInput(7, () => {}, { class: 'sm' });
+    const fxMin = numInput(fit && fit.range ? fit.range[0] : null, () => {}, { class: 'sm', placeholder: '최소 2θ' });
+    const fxMax = numInput(fit && fit.range ? fit.range[1] : null, () => {}, { class: 'sm', placeholder: '최대 2θ' });
+    const fitBasis = () => {
+      const X = xy.data[0], Y = xy.data[1];
+      if (bgPts.length >= 2) { const f = C.naturalSpline(bgPts); return { X, Y: Y.map((v, i) => v - f(X[i])), basis: 'bg_corrected', label: `배경 보정 데이터 (배경점 ${bgPts.length}개, 자연 3차 스플라인)` }; }
+      return { X, Y, basis: 'raw', label: '원본 강도 (배경점 없음 — 배경이 피크 높이·면적에 섞입니다)' };
+    };
+    const fitStale = () => fit && JSON.stringify(fit.background_points || []) !== JSON.stringify(bgPts);
+    function fitRange() {
+      const X = xy.data[0];
+      return [N(fxMin.value) ?? C.minOf(X), N(fxMax.value) ?? C.maxOf(X)];
+    }
+    function storeFit(extra) {
+      const b = fitBasis();
+      fit = Object.assign({ model: 'gaussian', formula: C.FIT_FORMULA, status: '피팅 추정 (실측 아님)', basis: b.basis, background_points: JSON.parse(JSON.stringify(bgPts)), range: fitRange(),
+        peaks: fitPeaks.map((p) => ({ label: p.label || '', center: p.center, fwhm: p.fwhm, height: p.height, area: p.height * p.fwhm * C.GAUSS_AREA_FACTOR, lock: p.lock || {} })) }, extra || {});
+      ctx.markDirty();
+    }
+    function renderFit() {
+      fitBox.innerHTML = ''; fitChart.innerHTML = ''; fitResid.innerHTML = ''; fitStatus.innerHTML = '';
+      if (!xy) { fitBox.appendChild(h('div', { class: 'muted small' }, 'XY 데이터를 불러오면 피팅할 수 있습니다.')); return; }
+      const b = fitBasis();
+      fitStatus.append(h('div', { class: b.basis === 'raw' ? 'badge-warn small' : 'note' }, '피팅 대상: ', b.label));
+      if (fit && fit.r2 !== undefined) fitStatus.append(h('div', { class: 'badge-info small' }, `피팅 추정 결과 — R² = ${fit.r2 !== null ? fit.r2.toFixed(5) : '—'}, 반복 ${fit.iterations}회${fit.converged ? ', 수렴' : ', 수렴 안 됨'}, 범위 ${fmt(fit.range[0])}–${fmt(fit.range[1])}°, 데이터 ${fit.n}점`,
+        fit.edited ? ' · 피팅 후 값을 직접 수정함' : '', h('div', {}, C.FIT_FORMULA)));
+      if (fitStale()) fitStatus.append(h('div', { class: 'badge-warn small' }, '피팅 후 배경점이 바뀌었습니다. 결과를 쓰기 전에 “피팅 실행”을 다시 누르세요.'));
+      const tbl = h('table', { class: 'tbl small' }, h('tr', {}, h('th', {}, '#'), h('th', {}, '라벨'), h('th', { class: 'num' }, '중심 2θ (°)'), h('th', {}, '고정'), h('th', { class: 'num' }, 'FWHM (°)'), h('th', {}, '고정'),
+        h('th', { class: 'num' }, '높이'), h('th', {}, '고정'), h('th', { class: 'num' }, '면적 (계산)'), h('th')));
+      fitPeaks.forEach((p, i) => {
+        p.lock = p.lock || {};
+        const ed = (k) => (v) => { if (v !== null) { p[k] = v; if (fit) fit.edited = true; storeFit(fit ? { r2: fit.r2, iterations: fit.iterations, converged: fit.converged, n: fit.n, edited: true } : {}); drawFit(); } };
+        const lk = (k) => { const c = h('input', { type: 'checkbox', checked: !!p.lock[k], title: '체크하면 피팅 중 이 값을 바꾸지 않습니다' }); c.onchange = () => { p.lock[k] = c.checked; ctx.markDirty(); }; return c; };
+        const lab = h('input', { type: 'text', value: p.label || '', class: 'sm' }); lab.oninput = () => { p.label = lab.value; ctx.markDirty(); };
+        tbl.appendChild(h('tr', {}, h('td', {}, h('span', { class: 'dot', style: { background: FIT_COLORS[i % FIT_COLORS.length] } }), i + 1), h('td', {}, lab),
+          h('td', { class: 'num' }, numInput(+p.center.toFixed(4), ed('center'))), h('td', {}, lk('center')),
+          h('td', { class: 'num' }, numInput(+p.fwhm.toFixed(4), ed('fwhm'))), h('td', {}, lk('fwhm')),
+          h('td', { class: 'num' }, numInput(+p.height.toFixed(2), ed('height'))), h('td', {}, lk('height')),
+          h('td', { class: 'num' }, fmt(p.height * p.fwhm * C.GAUSS_AREA_FACTOR)),
+          h('td', {}, h('button', { class: 'small link', onclick: () => { fitPeaks.splice(i, 1); storeFit(); renderFit(); } }, '삭제'))));
+      });
+      const addC = numInput(null, () => {}, { class: 'sm', placeholder: '2θ' });
+      fitBox.append(tbl, h('div', { class: 'row', style: { marginTop: '6px' } }, addC, h('button', { class: 'small', onclick: () => {
+        const c = N(addC.value); if (c === null) { PS.toast('추가할 피크의 2θ 를 입력하세요', 'bad'); return; }
+        const bb = fitBasis(); const yy = C.interp(bb.X, bb.Y, c);
+        fitPeaks.push({ center: c, fwhm: 0.4, height: Math.max(1, yy || 1), lock: {} }); fitPeaks.sort((a, b2) => a.center - b2.center); storeFit(); renderFit();
+      } }, '+ 피크 추가')));
+      drawFit();
+    }
+    function drawFit() {
+      fitChart.innerHTML = ''; fitResid.innerHTML = '';
+      if (!xy || !fitPeaks.length) return;
+      const b = fitBasis(), [lo, hi] = fitRange();
+      const X = [], Y = [];
+      b.X.forEach((x, i) => { if (x >= lo && x <= hi) { X.push(x); Y.push(b.Y[i]); } });
+      const series = [{ name: '데이터', color: ctx.sample.color, x: X, y: Y, width: 1.2 },
+        { name: 'Gaussian 합 (피팅 추정)', color: '#111', dash: '5 3', x: X, y: X.map((x) => C.gaussSum(x, fitPeaks)) }];
+      fitPeaks.forEach((p, i) => series.push({ name: `피크 ${i + 1}${p.label ? ' ' + p.label : ''}`, color: FIT_COLORS[i % FIT_COLORS.length], x: X, y: X.map((x) => C.gaussSum(x, [p])), width: 1 }));
+      PSChart.render(fitChart, { series, xLabel: '2θ (°)', yLabel: '강도', note: b.basis === 'raw' ? '원본 강도에 피팅' : '배경 보정 데이터에 피팅' });
+      PSChart.render(fitResid, { series: [{ name: '잔차 (데이터 − 피팅)', color: '#777', x: X, y: X.map((x, i) => Y[i] - C.gaussSum(x, fitPeaks)) }], xLabel: '2θ (°)', yLabel: '잔차', height: 160 });
+    }
+    const fitControls = h('div', { class: 'row', style: { margin: '6px 0' } },
+      h('label', {}, '피크 수'), nIn, h('button', { class: 'small', onclick: () => {
+        if (!xy) return;
+        const n = Math.max(1, Math.round(N(nIn.value) || 7));
+        const b = fitBasis(), [lo, hi] = fitRange();
+        const X = [], Y = [];
+        b.X.forEach((x, i) => { if (x >= lo && x <= hi) { X.push(x); Y.push(b.Y[i]); } });
+        fitPeaks = C.findPeaks(X, Y, n);
+        fitPeaks.forEach((p, i) => { p.label = C.XRD_DEFAULT_LABELS[i] || ''; });
+        fit = null; storeFit(); renderFit();
+      } }, '초기값 자동 찾기'),
+      h('label', {}, '범위'), fxMin, '–', fxMax, '°',
+      h('button', { class: 'primary small', onclick: () => {
+        if (!xy || !fitPeaks.length) { PS.toast('먼저 초기 피크를 만드세요', 'bad'); return; }
+        const b = fitBasis(), [lo, hi] = fitRange();
+        const r = C.fitGaussians(b.X, b.Y, fitPeaks, { xmin: lo, xmax: hi });
+        if (r.error) { PS.toast(r.error, 'bad'); return; }
+        fitPeaks = r.peaks.map((p, i) => Object.assign(p, { label: fitPeaks[i].label }));
+        storeFit({ r2: r.r2, iterations: r.iterations, converged: r.converged, n: r.n, fitted_at: new Date().toISOString(), edited: false });
+        renderFit();
+      } }, '피팅 실행'),
+      h('button', { class: 'small', onclick: async () => {
+        if (!fitPeaks.length && !fit) return;
+        if (!(await PS.confirm('피팅 결과와 피크 초기값을 지울까요?', { detail: '원본 XY 데이터와 위의 피크 표는 그대로 남습니다. 저장해야 반영됩니다.' }))) return;
+        fitPeaks = []; fit = null; ctx.markDirty(); renderFit();
+      } }, '피팅 지우기'),
+      h('button', { class: 'small', onclick: async () => {
+        if (!fit || fit.r2 === undefined) { PS.toast('먼저 피팅을 실행하세요', 'bad'); return; }
+        if (fitStale()) { PS.toast('배경점이 바뀌었습니다. 피팅을 다시 실행하세요', 'bad'); return; }
+        if (peaks.length && !(await PS.confirm('위 피크 표를 피팅 결과로 바꿀까요?', { detail: '가져온 피크는 “피팅 추정” 출처로 표시되어 실측·Origin 피크 표와 구분됩니다. 라벨이 없으면 2θ 순서대로 (110), (101)을 붙입니다.' }))) return;
+        peaks.length = 0;
+        fitPeaks.slice().sort((a, b) => a.center - b.center).forEach((p, i) => peaks.push({ label: p.label || C.XRD_DEFAULT_LABELS[i] || '', center: p.center, area: p.height * p.fwhm * C.GAUSS_AREA_FACTOR, fwhm: p.fwhm, gs_input: null, include: i !== 3, source: 'fit' }));
+        ctx.setSource({ peak_origin: 'XRD Gaussian 피팅 추정 (앱)', fit_basis: fit.basis, fit_r2: fit.r2 });
+        renderPeaks(); PS.toast('피크 표로 가져왔습니다 (피팅 추정)', 'ok');
+      } }, '피크 표로 가져오기'));
 
     const el = h('div', {},
       h('h3', {}, '피크 표 ', help('Origin 등에서 피크 표를 복사해 붙여 넣으면 열을 자동으로 찾습니다. 첫 번째, 두 번째 피크는 (110), (101)로 표시합니다.')),
@@ -543,15 +646,22 @@
         h('label', {}, corrChk, ' 배경 보정 결과 보기'), h('label', {}, normChk, ' 최고 피크로 정규화'),
         help('배경점은 클릭한 위치에서 가장 가까운 데이터점에 붙습니다. 배경선은 배경점을 지나는 자연 3차 스플라인입니다.\n원본 데이터는 그대로 저장되고 배경점만 함께 저장됩니다.')),
       chartBox, ptsList,
-      h('p', { class: 'note' }, '피크 피팅(Gaussian)은 아직 제공하지 않습니다. 피팅 결과는 Origin 등에서 얻은 피크 표를 붙여 넣어 기록하세요.'));
+      h('h3', {}, 'Gaussian 피팅 ', help('기본 7개 Gaussian 으로 XY 데이터를 맞춥니다. 피크를 추가·삭제하거나 위치·폭·높이를 직접 바꾸고, 고정한 값은 피팅 중 바뀌지 않습니다.\n원본 XY 는 바뀌지 않으며 결과는 “피팅 추정”으로 따로 저장됩니다.')),
+      h('div', { class: 'badge-warn small' }, '피팅 결과는 모델이 추정한 값입니다. 피크 수·초기값·범위·배경 처리에 따라 달라지므로 실측 사실로 취급하지 마세요.'),
+      fitControls, fitStatus, fitBox, fitChart, fitResid);
     return {
       el,
-      afterMount() { renderPeaks(); redraw(); },
+      afterMount() { renderPeaks(); redraw(); renderFit(); },
       collect() {
         const res = C.computeXrd(peaks, K(), L());
         const computed = { metrics: res.metrics, details: { peaks: res.peaks, constants: res.constants, formulas: res.formulas } };
         const datasets = [];
-        if (xy) { xy.meta = Object.assign({}, xy.meta, { background_points: bgPts, background_method: '자연 3차 스플라인 (사용자 지정 배경점)' }); datasets.push(xy); }
+        if (xy) {
+          xy.meta = Object.assign({}, xy.meta, { background_points: bgPts, background_method: '자연 3차 스플라인 (사용자 지정 배경점)' });
+          if (fit && fitPeaks.length) xy.meta.fit = Object.assign({}, fit, { stale: !!fitStale() }); else delete xy.meta.fit;
+          datasets.push(xy);
+        }
+        if (peaks.some((p) => p.source === 'fit')) computed.details.peak_origin = '일부 또는 전체 피크가 Gaussian 피팅 추정값입니다';
         return { values: rec.values, computed, datasets };
       },
     };

@@ -240,8 +240,8 @@
     return h('span', Object.assign({ class: 'st st-' + status.replace(/\s/g, '') }, extra || {}), status);
   };
   PS.srcBadge = function (src) {
-    const label = { default: '기본값', user: '입력', file: '파일', extracted: '추출', extracted_edited: '추출→수정', computed: '계산', snapshot: '측정 당시 고정', live: '세션 따라 갱신' }[src] || src;
-    const tip = { default: '앱 기본값입니다. 실제 조건으로 확인되지 않았습니다.', user: '사용자가 직접 입력하거나 확인한 값', file: '파일에 기재된 값을 자동 입력', extracted: '보고서/붙여넣기에서 추출된 값 (수정 안 함)', extracted_edited: '추출 후 사용자가 수정한 값', computed: '앱이 계산한 값', snapshot: '측정을 저장할 때의 조건으로 고정됩니다', live: '전극/세션 정보를 수정하면 함께 바뀝니다' }[src] || '';
+    const label = { default: '기본값', user: '입력', file: '파일', extracted: '추출', extracted_edited: '추출→수정', computed: '계산', fit: '피팅 추정', snapshot: '측정 당시 고정', live: '세션 따라 갱신' }[src] || src;
+    const tip = { default: '앱 기본값입니다. 실제 조건으로 확인되지 않았습니다.', user: '사용자가 직접 입력하거나 확인한 값', file: '파일에 기재된 값을 자동 입력', extracted: '보고서/붙여넣기에서 추출된 값 (수정 안 함)', extracted_edited: '추출 후 사용자가 수정한 값', computed: '앱이 계산한 값', fit: '앱의 Gaussian 피팅이 추정한 값 (실측 아님)', snapshot: '측정을 저장할 때의 조건으로 고정됩니다', live: '전극/세션 정보를 수정하면 함께 바뀝니다' }[src] || '';
     return src ? h('span', { class: 'src src-' + src, title: tip }, label) : null;
   };
   PS.sampleDot = (s) => h('span', { class: 'dot', style: { background: s.color } });

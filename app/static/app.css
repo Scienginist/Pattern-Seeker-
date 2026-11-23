@@ -177,3 +177,4 @@ details > summary { cursor: pointer; color: var(--accent); }
   .crumb { display: none; }
   .grid2 { grid-template-columns: 1fr; }
 }
+.src-fit { background: #fde8f3; color: #8a1d5c; border: 1px solid #f2bcd9; }

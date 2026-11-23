@@ -202,8 +202,9 @@
     peaks.forEach((p, i) => {
       const lab = (p.label || '').replace(/[()\s]/g, '');
       if (!['110', '101'].includes(lab)) return;
-      set('gs_' + lab, out[i].gs_nm, 'nm', C.XRD_GS_FORMULA, { FWHM: p.fwhm, '2θ': p.center, K, 'λ(nm)': lambda });
-      set('si_' + lab, out[i].si, '', C.XRD_SI_FORMULA, { area: p.area, FWHM: p.fwhm });
+      const origin = p.source === 'fit' ? { peak_source: 'Gaussian 피팅 추정' } : {};
+      set('gs_' + lab, out[i].gs_nm, 'nm', C.XRD_GS_FORMULA, Object.assign({ FWHM: p.fwhm, '2θ': p.center, K, 'λ(nm)': lambda }, origin));
+      set('si_' + lab, out[i].si, '', C.XRD_SI_FORMULA, Object.assign({ area: p.area, FWHM: p.fwhm }, origin));
       set('fwhm_' + lab, p.fwhm, '°', '입력값', {});
       set('center_' + lab, p.center, '°', '입력값', {});
     });
@@ -504,6 +505,142 @@
     if (C.isNum(cs) && cs > 0) res.ecsa_cm2 = cdl / cs;
     if (C.isNum(res.ecsa_cm2) && C.isNum(loadingMg) && loadingMg > 0) res.ecsa_per_mg = res.ecsa_cm2 / loadingMg;
     return res;
+  };
+
+  // ------------------------------------------------------------ XRD Gaussian 피팅 (Levenberg–Marquardt)
+  // 피크: {center, fwhm, height, lock:{center,fwhm,height}}  · 모델 f(x) = Σ H·exp(−4ln2·(x−c)²/w²)
+  const L4 = 4 * Math.LN2;
+  C.GAUSS_AREA_FACTOR = Math.sqrt(Math.PI / L4); // 면적 = H × FWHM × 1.0645
+  C.FIT_FORMULA = 'f(2θ) = Σ Hᵢ·exp(−4ln2·(2θ−cᵢ)²/wᵢ²),  면적ᵢ = Hᵢ × wᵢ × √(π/(4ln2)),  Levenberg–Marquardt 최소제곱';
+  C.gaussSum = function (x, peaks) {
+    let s = 0;
+    for (const p of peaks) { const d = x - p.center; s += p.height * Math.exp((-L4 * d * d) / (p.fwhm * p.fwhm)); }
+    return s;
+  };
+
+  C.findPeaks = function (x, y, n, opt) {
+    opt = Object.assign({ minSep: 0.4, window: 11 }, opt || {});
+    const ys = C.savgol(y, opt.window);
+    const cand = [];
+    for (let i = 2; i < ys.length - 2; i++) if (ys[i] > ys[i - 1] && ys[i] >= ys[i + 1] && ys[i] > ys[i - 2] && ys[i] >= ys[i + 2]) cand.push(i);
+    cand.sort((a, b) => ys[b] - ys[a]);
+    const picked = [];
+    for (const i of cand) {
+      if (picked.length >= n) break;
+      if (picked.some((j) => Math.abs(x[j] - x[i]) < opt.minSep)) continue;
+      if (ys[i] <= 0) continue;
+      picked.push(i);
+    }
+    return picked.sort((a, b) => x[a] - x[b]).map((i) => {
+      const half = ys[i] / 2;
+      let l = i, r = i;
+      while (l > 0 && ys[l] > half) l--;
+      while (r < ys.length - 1 && ys[r] > half) r++;
+      const w = Math.min(3, Math.max(0.05, x[r] - x[l]));
+      return { center: x[i], fwhm: w, height: ys[i], lock: {} };
+    });
+  };
+
+  function solve(A, b) {
+    const n = b.length, M = A.map((r, i) => r.concat([b[i]]));
+    for (let c = 0; c < n; c++) {
+      let piv = c;
+      for (let r = c + 1; r < n; r++) if (Math.abs(M[r][c]) > Math.abs(M[piv][c])) piv = r;
+      if (Math.abs(M[piv][c]) < 1e-300) return null;
+      [M[c], M[piv]] = [M[piv], M[c]];
+      for (let r = 0; r < n; r++) {
+        if (r === c) continue;
+        const f = M[r][c] / M[c][c];
+        if (f) for (let k = c; k <= n; k++) M[r][k] -= f * M[c][k];
+      }
+    }
+    return M.map((r, i) => r[n] / r[i]);
+  }
+
+  C.fitGaussians = function (xAll, yAll, peaks0, opt) {
+    opt = Object.assign({ xmin: -Infinity, xmax: Infinity, maxIter: 200, maxPts: 3000 }, opt || {});
+    let X = [], Y = [];
+    for (let i = 0; i < xAll.length; i++) if (xAll[i] >= opt.xmin && xAll[i] <= opt.xmax && C.isNum(yAll[i])) { X.push(xAll[i]); Y.push(yAll[i]); }
+    if (X.length > opt.maxPts) { const st = Math.ceil(X.length / opt.maxPts); X = X.filter((_, i) => i % st === 0); Y = Y.filter((_, i) => i % st === 0); }
+    const peaks = peaks0.map((p) => ({ center: p.center, fwhm: p.fwhm, height: p.height, lock: Object.assign({}, p.lock || {}), label: p.label }));
+    const keys = ['height', 'center', 'fwhm'];
+    const free = [];
+    peaks.forEach((p, k) => keys.forEach((key) => { if (!p.lock[key]) free.push([k, key]); }));
+    const xlo = Math.min(...X), xhi = Math.max(...X), span = xhi - xlo;
+    const clamp = () => peaks.forEach((p) => {
+      p.height = Math.max(0, p.height);
+      p.fwhm = Math.min(Math.max(p.fwhm, 1e-3), span);
+      p.center = Math.min(Math.max(p.center, xlo), xhi);
+    });
+    const sse = () => { let s = 0; for (let i = 0; i < X.length; i++) { const r = Y[i] - C.gaussSum(X[i], peaks); s += r * r; } return s; };
+    if (!X.length || !free.length) return { peaks, iterations: 0, converged: false, error: X.length ? '고정되지 않은 변수가 없습니다' : '피팅 범위에 데이터가 없습니다' };
+    let lambda = 1e-3, cur = sse(), it = 0, converged = false;
+    for (; it < opt.maxIter; it++) {
+      const m = free.length;
+      const JTJ = Array.from({ length: m }, () => new Array(m).fill(0)), JTr = new Array(m).fill(0);
+      const row = new Array(m);
+      for (let i = 0; i < X.length; i++) {
+        const r = Y[i] - C.gaussSum(X[i], peaks);
+        for (let j = 0; j < m; j++) {
+          const [k, key] = free[j], p = peaks[k], d = X[i] - p.center, w2 = p.fwhm * p.fwhm;
+          const g = Math.exp((-L4 * d * d) / w2);
+          row[j] = key === 'height' ? g : key === 'center' ? p.height * g * (2 * L4 * d) / w2 : p.height * g * (2 * L4 * d * d) / (w2 * p.fwhm);
+        }
+        for (let a = 0; a < m; a++) { if (!row[a]) continue; JTr[a] += row[a] * r; for (let b = a; b < m; b++) JTJ[a][b] += row[a] * row[b]; }
+      }
+      for (let a = 0; a < m; a++) for (let b = 0; b < a; b++) JTJ[a][b] = JTJ[b][a];
+      let improved = false;
+      for (let tries = 0; tries < 12; tries++) {
+        const A = JTJ.map((r, a) => r.map((v, b) => (a === b ? v * (1 + lambda) + 1e-12 : v)));
+        const delta = solve(A, JTr);
+        if (!delta) { lambda *= 10; continue; }
+        const backup = peaks.map((p) => ({ ...p }));
+        free.forEach(([k, key], j) => { peaks[k][key] += delta[j]; });
+        clamp();
+        const nw = sse();
+        if (nw < cur) { const rel = (cur - nw) / (cur || 1); cur = nw; lambda = Math.max(lambda / 10, 1e-12); improved = true; if (rel < 1e-9) converged = true; break; }
+        peaks.forEach((p, k) => Object.assign(p, backup[k]));
+        lambda *= 10;
+      }
+      if (!improved || converged) { converged = true; break; }
+    }
+    let my = 0; for (const v of Y) my += v; my /= Y.length;
+    let sst = 0; for (const v of Y) sst += (v - my) ** 2;
+    peaks.forEach((p) => { p.area = p.height * p.fwhm * C.GAUSS_AREA_FACTOR; });
+    return { peaks, iterations: it, converged, sse: cur, r2: sst ? 1 - cur / sst : null, n: X.length, range: [xlo, xhi] };
+  };
+
+  // ------------------------------------------------------------ 보정 회귀 (BET 예측 검증용)
+  const T95 = [12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228, 2.201, 2.179, 2.160, 2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086,
+    2.080, 2.074, 2.069, 2.064, 2.060, 2.056, 2.052, 2.048, 2.045, 2.042];
+  C.t95 = (df) => (df < 1 ? Infinity : df <= 30 ? T95[df - 1] : df <= 60 ? 2.0 : 1.96);
+  C.calibrate = function (xs, ys) {
+    const n = xs.length;
+    const lr = C.linreg(xs, ys);
+    if (!lr) return null;
+    const mx = xs.reduce((a, b) => a + b, 0) / n;
+    const sxx = xs.reduce((a, b) => a + (b - mx) ** 2, 0);
+    let sse = 0;
+    xs.forEach((x, i) => { sse += (ys[i] - (lr.slope * x + lr.intercept)) ** 2; });
+    const s = n > 2 ? Math.sqrt(sse / (n - 2)) : null;
+    // leave-one-out: 각 샘플을 빼고 맞춘 직선으로 그 샘플을 예측
+    const loo = [];
+    for (let k = 0; k < n; k++) {
+      const fx = xs.filter((_, i) => i !== k), fy = ys.filter((_, i) => i !== k);
+      const l = C.linreg(fx, fy);
+      loo.push(l ? { pred: l.slope * xs[k] + l.intercept, actual: ys[k] } : null);
+    }
+    const ok = loo.filter(Boolean);
+    const rmse = ok.length ? Math.sqrt(ok.reduce((a, o) => a + (o.pred - o.actual) ** 2, 0) / ok.length) : null;
+    const mape = ok.length ? (ok.reduce((a, o) => a + Math.abs((o.pred - o.actual) / o.actual), 0) / ok.length) * 100 : null;
+    return {
+      slope: lr.slope, intercept: lr.intercept, r2: lr.r2, n, s, mx, sxx, xmin: C.minOf(xs), xmax: C.maxOf(xs), loo, loo_rmse: rmse, loo_mape: mape,
+      predict(x) {
+        const y = lr.slope * x + lr.intercept;
+        const half = s !== null && sxx > 0 ? C.t95(n - 2) * s * Math.sqrt(1 + 1 / n + ((x - mx) ** 2) / sxx) : null;
+        return { y, lo: half !== null ? y - half : null, hi: half !== null ? y + half : null, inRange: x >= C.minOf(xs) && x <= C.maxOf(xs) };
+      },
+    };
   };
 
   // ------------------------------------------------------------ 표시

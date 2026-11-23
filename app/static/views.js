@@ -796,7 +796,7 @@
         h('div', { class: 'panel' }, h('h2', { style: { marginTop: 0 } }, '데이터 충분성'), h('div', { class: 'tablewrap' }, suff)),
         h('div', { class: 'panel' }, h('h2', { style: { marginTop: 0 } }, '다음 측정 제안'), h('p', { class: 'note' }, '아래 측정이 채워지면 위 비교의 n 이 늘어 판단이 쉬워집니다. 괄호는 현재 분석 상태입니다.'),
           sugg.length ? h('ul', { class: 'small' }, sugg.slice(0, 30).map((x) => h('li', {}, x))) : h('div', { class: 'muted' }, '선택 샘플들은 같은 특징을 모두 갖고 있습니다.')),
-        h('div', { class: 'note' }, 'BET 예측(전기화학 → BET) 모델은 아직 제공하지 않습니다. 실측 BET 와 Cdl 이 함께 있는 샘플이 충분히 쌓이면 “BET · 비표면적” 과 “ECSA · Cdl” 쌍에서 관계와 적용 범위를 먼저 확인하세요.'));
+        h('div', { class: 'note' }, 'Cdl 로 BET 를 추정하려면 ', h('a', { href: '#/bet-predict' }, 'BET 예측(검증형)'), ' 화면을 쓰세요. 실측 BET 로 보정·교차검증한 경우에만 예측값을 보여줍니다.'));
       drawPair();
     }
     view.innerHTML = '';
@@ -804,6 +804,109 @@
       h('p', { class: 'note' }, '기록된 데이터로 확인할 수 있는 관계와, 데이터가 부족해 판단할 수 없는 부분을 구분해 보여줍니다. 결과는 상관관계이며 인과관계가 아닙니다.'),
       h('div', { class: 'panel' }, samplePicker(samples, series, selected, () => {}), h('button', { class: 'primary', style: { marginTop: '8px' }, onclick: load }, '선택 샘플로 분석')), out);
     if (selected.size >= 2) load();
+  });
+
+
+  // ------------------------------------------------------------ BET 예측 (실측 BET 로 보정·검증한 경우에만)
+  PS.route('/bet-predict', async (p, view) => {
+    PS.crumb([{ label: 'BET 예측 (검증형)' }]);
+    const samples = await loadSamples();
+    const byId = Object.fromEntries(samples.map((s) => [s.id, s]));
+    const ms = (await PS.api.post('/metrics', { sample_ids: samples.map((s) => s.id) })).measurements;
+    const st = PS.store.get('betPred', { bet: 'report_first', x: 'per_mass', minN: 5 });
+    const betSel = PS.select([['report_first', '보고서 값 우선 (없으면 앱 재계산)'], ['report', '보고서 값만'], ['recalc', '앱 재계산 값만']], st.bet);
+    const xSel = PS.select([['per_mass', 'Cdl / 로딩 (mF/mg)'], ['cdl', 'Cdl (mF, 로딩 무시)']], st.x);
+    const out = h('div');
+    function build() {
+      PS.store.set('betPred', { bet: betSel.value, x: xSel.value, minN: 5 });
+      const bet = {}, xv = {};
+      for (const m of ms) {
+        if (m.analysis_code === 'BET') {
+          const rep = PS.metricOf(m, 'bet_ssa'), rc = PS.metricOf(m, 'bet_ssa_recalc');
+          const pick = betSel.value === 'report' ? (rep && { ...rep, which: '보고서' }) : betSel.value === 'recalc' ? (rc && { ...rc, which: '재계산' }) : (rep ? { ...rep, which: '보고서' } : rc && { ...rc, which: '재계산' });
+          if (pick) (bet[m.sample_id] = bet[m.sample_id] || []).push({ v: pick.value, which: pick.which, mid: m.id, cond: m.conditions });
+        }
+        if (m.analysis_code === 'ECSA') {
+          const cdl = PS.metricOf(m, 'cdl');
+          if (!cdl) continue;
+          const load = m.values && m.values.loading ? C.num(m.values.loading.value) : NaN;
+          const x = xSel.value === 'per_mass' ? (C.isNum(load) && load > 0 ? cdl.value / load : NaN) : cdl.value;
+          if (!C.isNum(x)) continue;
+          const snap = (m.conditions && m.conditions.session_snapshot) || {};
+          const cond = { 전해질: snap.electrolyte ? snap.electrolyte.value : '(기록 없음)', '선택 전위(V)': m.values && m.values.e_select, 로딩: C.isNum(load) ? load : '(없음)', 로딩출처: m.values && m.values.loading ? m.values.loading.source : '' };
+          (xv[m.sample_id] = xv[m.sample_id] || []).push({ v: x, cdl: cdl.value, load, mid: m.id, cond });
+        }
+      }
+      const avg = (a) => a.reduce((s, o) => s + o.v, 0) / a.length;
+      const train = Object.keys(xv).filter((id) => bet[id]).map((id) => ({ id: +id, x: avg(xv[id]), y: avg(bet[id]), nx: xv[id].length, ny: bet[id].length, xs: xv[id], ys: bet[id] }));
+      const targets = Object.keys(xv).filter((id) => !bet[id]).map((id) => ({ id: +id, x: avg(xv[id]), xs: xv[id] }));
+      out.innerHTML = '';
+      const xLabel = xSel.value === 'per_mass' ? 'Cdl / 로딩 (mF/mg)' : 'Cdl (mF)';
+      const warns = [];
+      const distinct = (f) => [...new Set(train.flatMap((t) => t.xs.map(f)).map(String))];
+      const el = distinct((o) => o.cond.전해질), es = distinct((o) => o.cond['선택 전위(V)']), ls = distinct((o) => o.cond.로딩출처);
+      if (el.length > 1) warns.push(`학습 샘플의 전해질이 섞여 있습니다: ${el.join(', ')}. 전해질이 다르면 Cdl 을 같은 기준으로 비교하기 어렵습니다.`);
+      if (es.length > 1) warns.push(`Cdl 계산에 쓴 선택 전위가 서로 다릅니다: ${es.join(', ')} V.`);
+      if (ls.includes('default')) warns.push('일부 샘플의 로딩이 확인되지 않은 기본값(0.222 mg)입니다.');
+      if (train.some((t) => t.nx > 1 || t.ny > 1)) warns.push('한 샘플에 측정이 여러 개 있으면 평균을 썼습니다.');
+      if (new Set(train.flatMap((t) => t.ys.map((o) => o.which))).size > 1) warns.push('학습 데이터에 보고서 BET 와 앱 재계산 BET 가 섞여 있습니다.');
+      const n = train.length;
+      const cal = n >= 3 ? C.calibrate(train.map((t) => t.x), train.map((t) => t.y)) : null;
+      const enough = cal && n >= 5;
+      const verdict = !cal ? { cls: 'badge-bad', text: `실측 BET 와 Cdl 이 모두 있는 샘플이 ${n}개입니다. 최소 3개가 있어야 관계를 볼 수 있고, 예측은 5개 이상에서만 제공합니다.` }
+        : !enough ? { cls: 'badge-bad', text: `학습 샘플 ${n}개 — 검증이 불충분해 예측값을 표시하지 않습니다 (5개 이상 필요). 아래 관계는 참고용입니다.` }
+          : cal.loo_mape > 30 ? { cls: 'badge-warn', text: `교차검증 평균 오차 ${fmt(cal.loo_mape, 1)} % — 예측 신뢰도가 낮습니다. 예측값은 대략적인 범위로만 보세요.` }
+            : { cls: 'badge-ok', text: `학습 샘플 ${n}개, 교차검증 평균 오차 ${fmt(cal.loo_mape, 1)} %. 아래 예측은 이 데이터 범위 안에서만 의미가 있습니다.` };
+      const chart = h('div');
+      out.append(h('div', { class: 'panel' }, h('h2', { style: { marginTop: 0 } }, '보정·검증'), h('div', { class: verdict.cls }, verdict.text),
+        warns.map((w) => h('div', { class: 'badge-warn small', style: { marginTop: '6px' } }, w)),
+        cal ? h('div', { class: 'small', style: { marginTop: '8px' } },
+          `BET = ${fmt(cal.slope, 3)} × x ${cal.intercept >= 0 ? '+' : '−'} ${fmt(Math.abs(cal.intercept), 2)}  ·  R² = ${cal.r2.toFixed(3)}  ·  n = ${n}  ·  `,
+          `LOO RMSE = ${fmt(cal.loo_rmse)} m²/g, LOO 평균 오차 = ${fmt(cal.loo_mape, 1)} %  ·  학습 범위 x = ${fmt(cal.xmin, 3)}–${fmt(cal.xmax, 3)}`,
+          help('LOO(leave-one-out): 샘플 하나씩 빼고 나머지로 직선을 맞춘 뒤 뺀 샘플을 예측해 오차를 구합니다. 실제 예측 성능에 가까운 지표입니다.')) : null,
+        chart,
+        h('h3', {}, '학습 데이터 (실측 BET 와 Cdl 이 모두 있는 샘플)'),
+        train.length ? h('div', { class: 'tablewrap' }, h('table', { class: 'tbl small' }, h('tr', {}, h('th', {}, '샘플'), h('th', { class: 'num' }, '실측 BET (m²/g)'), h('th', {}, 'BET 출처'), h('th', { class: 'num' }, xLabel), h('th', {}, '전해질'), h('th', { class: 'num' }, 'LOO 예측'), h('th', { class: 'num' }, '오차 %')),
+          train.map((t, i) => {
+            const lo = cal && cal.loo[i];
+            return h('tr', {}, h('td', {}, PS.sampleLink(byId[t.id])), h('td', { class: 'num' }, fmt(t.y)), h('td', {}, [...new Set(t.ys.map((o) => o.which))].join('/')), h('td', { class: 'num' }, fmt(t.x, 4)),
+              h('td', {}, [...new Set(t.xs.map((o) => o.cond.전해질))].join(', ')), h('td', { class: 'num' }, lo ? fmt(lo.pred) : '—'), h('td', { class: 'num' }, lo ? fmt(((lo.pred - lo.actual) / lo.actual) * 100, 1) : '—'));
+          }))) : h('div', { class: 'muted' }, '없음')));
+      const preds = cal && enough ? targets.map((t) => ({ ...t, p: cal.predict(t.x) })) : [];
+      out.append(h('div', { class: 'panel' }, h('h2', { style: { marginTop: 0 } }, 'BET 예측 (추정, 실측 아님)'),
+        !targets.length ? h('div', { class: 'muted' }, 'Cdl 은 있지만 실측 BET 가 없는 샘플이 없습니다.')
+          : !enough ? h('div', { class: 'muted' }, `예측 대상 ${targets.length}개가 있지만, 검증이 불충분해 값을 표시하지 않습니다.`)
+            : h('table', { class: 'tbl small' }, h('tr', {}, h('th', {}, '샘플'), h('th', { class: 'num' }, xLabel), h('th', { class: 'num' }, '예측 BET (m²/g)'), h('th', { class: 'num' }, '95 % 예측구간'), h('th', {}, '적용 범위')),
+              preds.map((t) => h('tr', { style: t.p.inRange ? null : { color: '#9aa1ad' } }, h('td', {}, PS.sampleLink(byId[t.id])), h('td', { class: 'num' }, fmt(t.x, 4)),
+                h('td', { class: 'num' }, fmt(t.p.y)), h('td', { class: 'num' }, !t.p.inRange ? '외삽 — 구간 신뢰 불가' : t.p.lo !== null ? `${fmt(t.p.lo)} – ${fmt(t.p.hi)}` : '—'),
+                h('td', {}, t.p.inRange ? '학습 범위 안' : h('span', { class: 'flag' }, '학습 범위 밖 — 외삽, 신뢰할 수 없음'))))),
+        h('p', { class: 'note' }, '예측값은 저장하지 않습니다. 이 샘플의 BET 를 실제로 측정해 학습 데이터에 더하면 보정이 개선됩니다. Cdl 은 전기화학적 정전용량이며 BET 비표면적의 직접 측정값이 아닙니다. 두 값의 관계는 재료·전해질·전극 조건에 따라 달라질 수 있습니다.')));
+      if (train.length) {
+        const xr = train.map((t) => t.x).concat(preds.map((t) => t.x));
+        const lo = C.minOf(xr), hi = C.maxOf(xr), grid = [];
+        for (let k = 0; k <= 40; k++) grid.push(lo + ((hi - lo) * k) / 40);
+        const series = [{ name: '학습 샘플 (실측 BET)', color: '#888', x: train.map((t) => t.x), y: train.map((t) => t.y), mode: 'points', r: 0.1, noLegend: true }];
+        if (cal) {
+          series.push({ name: '보정 직선', color: '#333', x: grid, y: grid.map((x) => cal.slope * x + cal.intercept) });
+          if (cal.s !== null) {
+            series.push({ name: '95 % 예측구간', color: '#999', dash: '4 4', x: grid, y: grid.map((x) => cal.predict(x).lo) });
+            series.push({ name: '', noLegend: true, color: '#999', dash: '4 4', x: grid, y: grid.map((x) => cal.predict(x).hi) });
+          }
+        }
+        const markers = train.map((t) => ({ x: t.x, y: t.y, color: byId[t.id].color, label: `${byId[t.id].name}: 실측 ${fmt(t.y)} m²/g`, showLabel: train.length <= 12 }))
+          .concat(preds.map((t) => ({ x: t.x, y: t.p.y, color: byId[t.id].color, shape: 'square', label: `${byId[t.id].name}: 예측 ${fmt(t.p.y)} m²/g${t.p.inRange ? '' : ' (범위 밖)'}`, showLabel: true })));
+        PSChart.render(chart, { series, markers, bands: cal ? [{ from: cal.xmin, to: cal.xmax, color: '#2ca02c', label: '학습 범위' }] : [], xLabel, yLabel: 'BET 비표면적 (m²/g)',
+          note: '● 실측  ■ 예측(추정)  초록 띠: 학습 범위', height: 340 });
+      }
+    }
+    betSel.onchange = build; xSel.onchange = build;
+    view.innerHTML = '';
+    view.append(h('h1', {}, 'BET 예측 (검증형)'),
+      h('div', { class: 'badge-info small' }, '사용자의 실측 BET 와 전기화학 Cdl 을 짝지어 직선 보정을 만들고, 교차검증으로 오차를 확인한 경우에만 Cdl 만 있는 샘플의 BET 를 추정합니다. 샘플이 적거나 학습 범위를 벗어나면 그 사실을 표시합니다.'),
+      h('div', { class: 'row', style: { margin: '10px 0' } }, h('label', {}, '실측 BET'), betSel, h('label', {}, '예측 변수'), xSel,
+        help('Cdl 은 전극에 올린 분말 양에 비례하므로 BET(m²/g)와 비교할 때는 로딩으로 나눈 값(mF/mg)을 기본으로 씁니다.')),
+      out);
+    build();
   });
 
   // ------------------------------------------------------------ 시리즈
