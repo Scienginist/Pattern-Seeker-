@@ -1,0 +1,3 @@
+# 실행 필수 패키지 없음(Python 표준 라이브러리만 사용).
+# 창으로 띄우기(Windows Edge WebView2)
+pywebview==6.2.1

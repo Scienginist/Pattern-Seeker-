@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="cf-token" content="__CF_TOKEN__">
+<title>CatalystFlow</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div class="nav-hist">
+    <button class="icon" data-act="back" title="뒤로 (Alt+←)">◀</button>
+    <button class="icon" data-act="forward" title="앞으로 (Alt+→)">▶</button>
+  </div>
+  <div class="brand">CatalystFlow</div>
+  <nav class="tabs">
+    <a href="#/" data-nav="home">현황</a>
+    <a href="#/batches" data-nav="batches">배치</a>
+    <a href="#/raw" data-nav="raw">원료</a>
+    <a href="#/products" data-nav="products">제품</a>
+    <a href="#/qc" data-nav="qc">QC</a>
+    <a href="#/records" data-nav="records">기록·백업</a>
+  </nav>
+  <div class="spacer"></div>
+  <div id="draft-indicator" class="draft-indicator" hidden></div>
+</header>
+<div class="layout">
+  <main id="view" tabindex="-1"></main>
+  <aside id="panel" class="panel" hidden aria-live="polite"></aside>
+</div>
+<div id="toast" class="toast" hidden></div>
+<div id="modal" class="modal" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>
