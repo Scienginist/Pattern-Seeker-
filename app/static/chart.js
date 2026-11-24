@@ -153,7 +153,7 @@
             const v = gr.values[ci];
             const bx = m.l + ci * bw + bw * 0.1 + gi * gw;
             if (!fin(v)) {
-              el('text', { x: bx + gw / 2, y: sy(Math.max(y0, 0)) - 4, 'text-anchor': 'middle', class: 'ps-na' }, plot).textContent = '없음';
+              el('text', { x: bx + gw / 2, y: sy(Math.max(y0, 0)) - 4, 'text-anchor': 'middle', class: 'ps-na' }, plot).textContent = '값 없음';
               return;
             }
             const top = sy(Math.max(v, 0)), bot = sy(Math.min(v, 0));

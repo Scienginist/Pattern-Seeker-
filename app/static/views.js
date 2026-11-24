@@ -114,7 +114,7 @@
     }
     q.oninput = render; sort.onchange = render; ser.onchange = render;
     view.innerHTML = '';
-    view.append(h('div', { class: 'row' }, h('h1', { class: 'grow' }, '샘플'), h('button', { class: 'primary', onclick: async () => {
+    view.append(h('div', { class: 'row' }, h('h1', { class: 'grow' }, '샘플'), h('a', { href: '#/import/xrf' }, h('button', {}, 'XRF 성적서 일괄 가져오기')), h('button', { class: 'primary', onclick: async () => {
       const id = await sampleForm(null, samples, series);
       if (id) PS.go('#/sample/' + id);
     } }, '+ 새 샘플')),
@@ -909,6 +909,143 @@
     build();
   });
 
+
+  // ------------------------------------------------------------ XRF 성적서 일괄 가져오기
+  PS.route('/import/xrf', async (p, view) => {
+    PS.crumb([{ label: '샘플', href: '#/samples' }, { label: 'XRF 성적서 일괄 가져오기' }]);
+    let samples = await loadSamples();
+    const cfg = (PS.typeMap.XRF || {}).config || {};
+    const items = []; // {name, path?, file?, status, report, error, target, newName, dup, result}
+    const dirIn = h('input', { type: 'text', placeholder: '성적서 폴더 경로 (예: D:\\보관소\\XRF\\2026-11)', style: { flex: 1, minWidth: '320px' } });
+    const recur = h('input', { type: 'checkbox' });
+    const fileIn = h('input', { type: 'file', multiple: true, accept: '.pdf,.txt' });
+    const attMode = PS.select([['link', '원본 경로만 연결 (기본)'], ['copy', '앱 폴더에 복사'], ['none', '첨부 안 함']], 'link');
+    const listBox = h('div'), actBox = h('div');
+    const keyOf = (s) => C.nameKey(s);
+    const stem = (n) => String(n || '').replace(/\.[^.]+$/, '').replace(/[_\s-]*METAL$/i, '');
+    async function existingXrf() {
+      const ids = samples.map((s) => s.id);
+      if (!ids.length) return [];
+      return (await PS.api.post('/metrics', { sample_ids: ids })).measurements.filter((m) => m.analysis_code === 'XRF');
+    }
+    async function readAll() {
+      const xrfs = await existingXrf();
+      for (const it of items) {
+        if (it.report || it.error) continue;
+        it.status = '읽는 중';
+        render();
+        try {
+          let r;
+          if (it.path) r = await PS.api.post('/files/read', { path: it.path });
+          else if (/\.pdf$/i.test(it.name)) r = await PS.api.post('/extract', { file_name: it.name, content_b64: await PS.readFileAsB64(it.file) });
+          else r = { text: await PS.readFileAsText(it.file), method: 'text' };
+          it.method = r.method;
+          it.report = C.parseXrfReport(r.text);
+          if (!it.report.rows.length) throw new Error('성분 표를 찾지 못했습니다');
+          // 샘플 매칭: 성적서 샘플명 → 파일 이름 순으로 정규화 이름 일치 확인
+          const keys = [it.report.meta.sample_name, stem(it.name)].filter(Boolean).map(keyOf);
+          const hit = samples.find((s) => keys.includes(keyOf(s.name)));
+          it.target = hit ? String(hit.id) : '';
+          it.newName = (it.report.meta.sample_name || stem(it.name)).normalize('NFKC').trim();
+          const da = it.report.meta.date_analyzed;
+          it.dup = hit ? xrfs.find((m) => m.sample_id === hit.id && ((m.source && m.source.file_name === it.name) ||
+            (m.values && m.values.report && m.values.report.date_analyzed_raw && m.values.report.date_analyzed_raw === it.report.meta.date_analyzed_raw))) : null;
+          if (it.dup) it.target = '';
+          it.status = '확인 필요';
+          void da;
+        } catch (e) { it.error = e.message; it.status = '읽기 실패'; }
+        render();
+      }
+    }
+    function render() {
+      listBox.innerHTML = '';
+      if (!items.length) { listBox.appendChild(h('div', { class: 'muted' }, '폴더 경로를 넣거나 파일을 고르세요.')); actBox.innerHTML = ''; return; }
+      const tbl = h('table', { class: 'tbl small' }, h('tr', {}, h('th', {}, '파일'), h('th', {}, '성적서 샘플명'), h('th', {}, '분석일'), h('th', {}, '주성분·순도'), h('th', { class: 'num' }, 'Cl'), h('th', { class: 'num' }, 'Si'), h('th', { class: 'num' }, 'Na'),
+        h('th', {}, '저장할 샘플', help('샘플명이 정확히 맞는 샘플은 자동으로 고릅니다(전각·기호·공백 무시). 맞는 샘플이 없으면 “건너뛰기”가 기본이며, 새 샘플로 만들지 직접 고르세요.')), h('th', {}, '결과')));
+      for (const it of items) {
+        let cells = [h('td', {}, '—'), h('td', {}, '—'), h('td', {}, '—'), h('td'), h('td'), h('td')];
+        if (it.report) {
+          const built = PS.xrfRecord(it.report, cfg);
+          const imp = built.computed.details.impurities;
+          const cell = (el) => h('td', { class: 'num' }, imp[el] ? (C.isNum(imp[el].value) ? fmt(imp[el].value, 3) : C.XRF_STATUS[imp[el].status]) : h('span', { class: 'muted' }, '보고 없음'));
+          const pur = built.computed.metrics.purity;
+          cells = [h('td', {}, it.report.meta.sample_name || h('span', { class: 'muted' }, '(없음)')), h('td', {}, it.report.meta.date_analyzed ? it.report.meta.date_analyzed.date : '—'),
+            h('td', {}, built.values.main_components.join('+') || '—', pur ? ` ${fmt(pur.value)} %` : '', built.values.main_auto ? h('span', { class: 'flag', title: built.values.main_auto_reason }, ' (자동)') : null),
+            cell('Cl'), cell('Si'), cell('Na')];
+        }
+        const sel = PS.select([['', it.dup ? '건너뛰기 (이미 가져온 성적서로 보임)' : '건너뛰기']].concat([['__new', `새 샘플 만들기: ${it.newName || ''}`]]).concat(samples.map((s) => [String(s.id), s.name])), it.target || '', { disabled: !it.report || !!it.result });
+        sel.onchange = () => { it.target = sel.value; render(); };
+        const nameIn = it.target === '__new' && !it.result ? h('input', { type: 'text', value: it.newName, class: 'sm', style: { width: '140px' }, oninput: (e) => { it.newName = e.target.value; } }) : null;
+        tbl.appendChild(h('tr', {}, h('td', { title: it.path || '' }, it.name), ...cells, h('td', {}, sel, nameIn, it.dup ? h('div', { class: 'flag' }, `같은 샘플에 같은 성적서 기록 있음: `, h('a', { href: '#/m/' + it.dup.id }, '#' + it.dup.id)) : null),
+          h('td', {}, it.result ? (it.result.ok ? h('a', { href: '#/m/' + it.result.id, style: { color: '#1e8e4e' } }, '✓ 저장됨 #' + it.result.id) : h('span', { style: { color: '#c0392b' } }, '✕ ' + it.result.error))
+            : it.error ? h('span', { style: { color: '#c0392b' } }, it.error) : it.status || '')));
+      }
+      listBox.appendChild(h('div', { class: 'tablewrap' }, tbl));
+      const chosen = items.filter((it) => it.report && it.target && !it.result);
+      actBox.innerHTML = '';
+      actBox.append(h('div', { class: 'row', style: { marginTop: '10px' } }, h('label', {}, '원본 첨부'), attMode,
+        h('button', { class: 'primary', disabled: !chosen.length, onclick: saveAll }, `선택한 ${chosen.length}개 저장`),
+        h('span', { class: 'note' }, '저장하면 샘플별 XRF 기록이 만들어지고 상태가 “자료 있음”이 됩니다. 추출값은 “추출” 출처로 표시되며 기록 화면에서 확인·수정할 수 있습니다.')));
+    }
+    async function saveAll() {
+      const chosen = items.filter((it) => it.report && it.target && !it.result);
+      if (!(await PS.confirm(`${chosen.length}개 성적서를 저장할까요?`, { detail: `새 샘플 ${chosen.filter((x) => x.target === '__new').length}개가 만들어집니다. 저장 전 자동 백업을 만듭니다.` }))) return;
+      try { await PS.api.post('/backups', { reason: 'XRF 일괄 가져오기 직전 자동 백업' }); } catch (e) { if (!(await PS.confirm('백업 생성에 실패했습니다. 그래도 계속할까요?', { detail: e.message }))) return; }
+      for (const it of chosen) {
+        try {
+          let sid = it.target;
+          if (sid === '__new') {
+            if (!it.newName.trim()) throw new Error('새 샘플 이름이 비어 있습니다');
+            const ex = samples.find((s) => keyOf(s.name) === keyOf(it.newName));
+            sid = ex ? ex.id : (await PS.api.post('/samples', { name: it.newName.trim(), notes: `XRF 성적서 일괄 가져오기로 생성 (${it.name})` })).id;
+          }
+          const built = PS.xrfRecord(it.report, cfg);
+          const da = it.report.meta.date_analyzed;
+          const id = (await PS.api.post('/measurements', {
+            sample_id: +sid, analysis_code: 'XRF', title: `XRF ${it.report.meta.sample_name || stem(it.name)}`, measured_on: da ? da.date : null, measured_on_source: da ? 'file' : 'none',
+            values: built.values, computed: built.computed, notes: '',
+            source: { method: it.method || 'pdf_text', file_name: it.name, edited: false, report_format: it.report.format, report_sample: it.report.meta.sample_name || null, date_from: da ? `${it.name} (Date analyzed)` : null, imported: 'XRF 일괄 가져오기' },
+          })).id;
+          if (attMode.value !== 'none') {
+            try {
+              const body = { measurement_id: id, mode: attMode.value, role: '성적서', file_name: it.name };
+              if (it.path) body.path = it.path;
+              else { body.mode = 'copy'; body.content_b64 = await PS.readFileAsB64(it.file); }
+              if (it.path || attMode.value === 'copy') await PS.api.post('/attachments', body);
+            } catch (e) { it.attErr = e.message; }
+          }
+          it.result = { ok: true, id, note: it.attErr ? '첨부 실패: ' + it.attErr : '' };
+        } catch (e) { it.result = { ok: false, error: e.message }; }
+        render();
+      }
+      samples = await loadSamples();
+      const ok = chosen.filter((x) => x.result && x.result.ok).length;
+      PS.toast(`${ok}/${chosen.length}개 저장${ok < chosen.length ? ' — 실패한 행을 확인하세요' : ''}`, ok === chosen.length ? 'ok' : 'bad', 8000);
+      render();
+    }
+    view.innerHTML = '';
+    view.append(h('h1', {}, 'XRF 성적서 일괄 가져오기'),
+      h('p', { class: 'note' }, 'Rigaku SQX(“SQX Calculation Result”) 성적서 PDF 를 여러 개 읽어 샘플별 XRF 기록으로 저장합니다. 측정일은 성적서의 “Date analyzed”를 쓰고, Trace·불검출 성분은 0 이 아니라 값 없음으로 저장합니다.'),
+      h('div', { class: 'panel' },
+        h('div', { class: 'row' }, dirIn, h('label', {}, recur, ' 하위 폴더 포함'), h('button', { onclick: async () => {
+          if (!dirIn.value.trim()) return;
+          try {
+            const r = await PS.api.post('/files/list', { dir: dirIn.value, recursive: recur.checked, exts: ['.pdf'] });
+            for (const f of r.files) if (!items.some((x) => x.path === f.path)) items.push({ name: f.name, path: f.path });
+            if (!r.files.length) PS.toast('PDF 가 없습니다', 'bad');
+            render(); await readAll();
+          } catch (e) { PS.toast(e.message, 'bad'); }
+        } }, '폴더에서 PDF 찾기')),
+        h('div', { class: 'row', style: { marginTop: '8px' } }, fileIn, h('button', { onclick: async () => {
+          for (const f of fileIn.files) items.push({ name: f.name, file: f });
+          fileIn.value = '';
+          render(); await readAll();
+        } }, '선택한 파일 추가'), h('span', { class: 'small muted' }, '브라우저에서 고른 파일은 원래 경로를 알 수 없어 “앱 폴더에 복사” 또는 첨부 없음만 가능합니다.'),
+          h('button', { class: 'small', onclick: () => { items.length = 0; render(); } }, '목록 비우기'))),
+      listBox, actBox);
+    render();
+  });
+
   // ------------------------------------------------------------ 시리즈
   PS.route('/series', async (p, view) => {
     PS.crumb([{ label: '시리즈' }]);
@@ -1020,7 +1157,7 @@
       h('div', { class: 'panel' }, h('h2', { style: { marginTop: 0 } }, '기본값'), defPanel, defBar.el),
       h('div', { class: 'panel' }, h('div', { class: 'row' }, h('h2', { class: 'grow', style: { marginTop: 0 } }, '분석 종류'), h('button', { onclick: async () => { if (await addType()) PS.refresh(); } }, '+ 분석 종류 추가')), typeTbl),
       h('div', { class: 'panel' }, h('h2', { style: { marginTop: 0 } }, '기능 상태'),
-        h('div', {}, 'PDF 텍스트 추출: ', meta.capabilities.pdf_text ? '사용 가능 (pypdf)' : h('span', { class: 'flag' }, '사용 불가 — pip install pypdf 로 설치하거나 PDF 텍스트를 복사해 붙여 넣으세요')),
+        h('div', {}, 'PDF 텍스트 추출: 내장 추출기 사용 가능 (장비 “인쇄→PDF” 양식)', meta.capabilities.pypdf ? ' + pypdf (보조)' : h('span', { class: 'muted' }, ' · pypdf 없음 — 내장 추출기로 못 읽는 PDF 는 pip install pypdf 또는 텍스트 붙여넣기')),
         h('div', {}, '이미지 OCR: ', meta.capabilities.ocr ? '사용 가능 (Tesseract)' : h('span', { class: 'flag' }, '사용 불가 — Tesseract + pytesseract 설치 시 활성화. 없으면 값을 직접 입력하세요')),
         h('div', { class: 'small muted' }, `스키마 버전 v${meta.schema_version}`)),
       h('div', { class: 'panel' }, h('h2', { style: { marginTop: 0 } }, '최근 변경 이력'), h('div', { class: 'tablewrap', style: { maxHeight: '260px' } },

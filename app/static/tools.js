@@ -794,30 +794,66 @@
   };
 
   // ------------------------------------------------------------ XRF
+  // 성적서 파싱 결과 → 측정 기록의 values / computed (단일 입력과 일괄 가져오기에서 같이 사용)
+  PS.xrfRecord = function (report, cfg, overrides) {
+    overrides = overrides || {};
+    const comps = report.rows.map((r) => Object.assign({}, r));
+    const interest = overrides.interest_elements || (cfg.interest_elements || ['Cl', 'Si', 'Na']).slice();
+    const dm = overrides.main_components ? { list: overrides.main_components, auto: !!overrides.main_auto } : C.xrfDefaultMains(comps, cfg.main_components || []);
+    const values = { components: comps, main_components: dm.list, main_auto: !!dm.auto, main_auto_reason: dm.reason || null, interest_elements: interest,
+      report: Object.assign({}, report.meta, { format: report.format }) };
+    const r = C.computeXrf(comps, dm.list, interest);
+    const computed = { metrics: r.metrics, details: { total_quantified: r.total_reported, impurities: r.impurities, not_reported: r.not_reported, non_quantified: r.non_quantified,
+      formula: C.XRF_PURITY_FORMULA, main_selection: dm.auto ? `자동 선택: ${dm.reason}` : '설정/사용자 선택' } };
+    return { values, computed };
+  };
+
   PS.tools.xrf = function (ctx) {
     const { rec, cfg } = ctx;
     rec.values.components = rec.values.components || [];
     const comps = rec.values.components;
-    rec.values.main_components = rec.values.main_components || null;
     rec.values.interest_elements = rec.values.interest_elements || (cfg.interest_elements || ['Cl', 'Si', 'Na']).slice();
-    const tblBox = h('div'), resBox = h('div', { style: { marginTop: '8px' } });
+    if (!rec.values.main_components) { const dm = C.xrfDefaultMains(comps, cfg.main_components || []); rec.values.main_components = dm.list; rec.values.main_auto = dm.auto; rec.values.main_auto_reason = dm.reason || null; }
+    const tblBox = h('div'), resBox = h('div', { style: { marginTop: '8px' } }), metaBox = h('div');
     const intIn = h('input', { type: 'text', value: rec.values.interest_elements.join(', '), style: { width: '200px' } });
     intIn.oninput = () => { rec.values.interest_elements = intIn.value.split(/[,\s]+/).filter(Boolean); ctx.markDirty(); renderRes(); };
-    const mains = () => rec.values.main_components || comps.filter((c) => (cfg.main_components || []).includes(c.component)).map((c) => c.component);
+    const mains = () => rec.values.main_components || [];
+    function renderMeta() {
+      metaBox.innerHTML = '';
+      const m = rec.values.report;
+      if (!m || !m.format) return;
+      const rows = [['양식', m.format], ['성적서 샘플명', m.sample_name], ['분석 일시 (Date analyzed)', m.date_analyzed ? `${m.date_analyzed.date} ${m.date_analyzed.time || ''}` : m.date_analyzed_raw],
+        ['출력 일시', m.printed ? `${m.printed.date} ${m.printed.time || ''}` : ''], ['Application', m.application], ['Sample type', m.sample_type], ['Balance', m.balance || '(없음)'],
+        ['Sample film corr.', m.film_correction], ['Impurity corr.', m.impurity_correction || '(없음)'],
+        ['Result 합계', C.isNum(m.result_sum) ? fmt(m.result_sum, 3) + ' %' : ''], ['w/o normal 합계', C.isNum(m.wo_normal_sum) ? fmt(m.wo_normal_sum, 3) + ' % (정규화 전)' : '']].filter((r) => r[1]);
+      metaBox.append(h('div', { class: 'kv', style: { marginBottom: '8px' } }, rows.flatMap(([k, v]) => [h('span', {}, k), h('span', {}, v)])));
+      if (m.sample_name && C.nameKey(m.sample_name) !== C.nameKey(ctx.sample.name)) {
+        metaBox.append(h('div', { class: 'badge-warn small' }, `성적서의 샘플명 “${m.sample_name}” 이(가) 앱 샘플명 “${ctx.sample.name}” 과(와) 다릅니다. 맞는 샘플의 성적서인지 확인하세요.`));
+      }
+    }
     function renderTbl() {
       tblBox.innerHTML = '';
-      const tbl = h('table', { class: 'tbl', style: { maxWidth: '900px' } }, h('tr', {}, h('th', {}, '성분'), h('th', { class: 'num' }, '함량'), h('th', {}, '단위'), h('th', {}, '출처'), h('th', {}, '주성분', help('순도 계산의 분자에 들어갈 성분입니다. 기본: IrO2')), h('th', {}, '추출 근거 (원문 줄)'), h('th')));
+      const hasSqx = comps.some((c) => c.det_limit !== undefined);
+      const tbl = h('table', { class: 'tbl', style: { maxWidth: '1100px' } }, h('tr', {}, h('th', {}, '성분'), h('th', {}, '상태', help('정량: 함량 값 있음 · Trace: 검출됐으나 정량 불가 · 불검출 · 검출한계 미만\n정량이 아닌 성분은 값이 비어 있고 순도 합계에서 빠집니다. 0 으로 바꾸지 않습니다.')),
+        h('th', { class: 'num' }, '함량'), h('th', {}, '단위'), hasSqx ? h('th', { class: 'num' }, '검출한계') : null, hasSqx ? h('th', {}, '분석선') : null,
+        h('th', {}, '출처'), h('th', {}, '주성분', help('순도 계산의 분자에 들어갈 성분입니다.')), h('th', {}, '추출 근거 (원문 줄)'), h('th')));
       comps.forEach((c, i) => {
+        c.status = c.status || (C.isNum(c.value) ? 'quantified' : 'nd');
         const nm = h('input', { type: 'text', value: c.component, class: 'sm' });
         const edited = () => { if (c.source === 'extracted') { c.source = 'extracted_edited'; rec.source.edited = true; } ctx.markDirty(); renderRes(); };
         nm.oninput = () => { c.component = nm.value.trim(); edited(); };
+        const st = PS.select(Object.entries(C.XRF_STATUS), c.status);
+        const vin = numInput(c.value, (v) => { c.value = v; if (v !== null) { c.status = 'quantified'; st.value = 'quantified'; } edited(); }, { placeholder: c.status === 'quantified' ? '값' : C.XRF_STATUS[c.status], disabled: c.status !== 'quantified' });
+        st.onchange = () => { c.status = st.value; if (c.status !== 'quantified') { c.value = null; vin.value = ''; } vin.disabled = c.status !== 'quantified'; vin.placeholder = c.status === 'quantified' ? '값' : C.XRF_STATUS[c.status]; edited(); };
         const un = PS.select(['%', 'ppm'], c.unit || '%'); un.onchange = () => { c.unit = un.value; edited(); };
         const mc = h('input', { type: 'checkbox', checked: mains().includes(c.component) });
-        mc.onchange = () => { const s = new Set(mains()); if (mc.checked) s.add(c.component); else s.delete(c.component); rec.values.main_components = [...s]; ctx.markDirty(); renderRes(); };
-        tbl.appendChild(h('tr', {}, h('td', {}, nm), h('td', { class: 'num' }, numInput(c.value, (v) => { c.value = v; edited(); }, { placeholder: '추출 실패' })), h('td', {}, un), h('td', {}, PS.srcBadge(c.source)), h('td', {}, mc),
-          h('td', { class: 'small muted mono' }, c.line || ''), h('td', {}, h('button', { class: 'small link', onclick: () => { comps.splice(i, 1); ctx.markDirty(); renderTbl(); } }, '삭제'))));
+        mc.onchange = () => { const s2 = new Set(mains()); if (mc.checked) s2.add(c.component); else s2.delete(c.component); rec.values.main_components = [...s2]; rec.values.main_auto = false; ctx.markDirty(); renderRes(); };
+        tbl.appendChild(h('tr', { style: c.status !== 'quantified' ? { color: '#7a8190' } : null }, h('td', {}, nm), h('td', {}, st), h('td', { class: 'num' }, vin), h('td', {}, un),
+          hasSqx ? h('td', { class: 'num small' }, C.isNum(c.det_limit) ? c.det_limit : '') : null, hasSqx ? h('td', { class: 'small' }, c.el_line || '') : null,
+          h('td', {}, PS.srcBadge(c.source)), h('td', {}, mc),
+          h('td', { class: 'small muted mono' }, c.line_text || c.line || ''), h('td', {}, h('button', { class: 'small link', onclick: () => { comps.splice(i, 1); ctx.markDirty(); renderTbl(); } }, '삭제'))));
       });
-      tblBox.append(tbl, h('button', { class: 'small', style: { marginTop: '6px' }, onclick: () => { comps.push({ component: '', value: null, unit: '%', source: 'user' }); ctx.markDirty(); renderTbl(); } }, '+ 성분 추가'));
+      tblBox.append(tbl, h('button', { class: 'small', style: { marginTop: '6px' }, onclick: () => { comps.push({ component: '', value: null, status: 'quantified', unit: '%', source: 'user' }); ctx.markDirty(); renderTbl(); } }, '+ 성분 추가'));
       renderRes();
     }
     function renderRes() {
@@ -825,29 +861,38 @@
       resBox.innerHTML = '';
       const p = r.metrics.purity;
       resBox.append(h('div', { class: 'badge-info' },
-        h('div', {}, h('b', {}, '계산 순도: '), p ? fmt(p.value) + ' %' : '— (주성분을 선택하세요)', p ? h('span', { class: 'small' }, `  (주성분 ${mains().join('+')} / 보고 합계 ${fmt(r.total_reported)} %)`) : null),
+        h('div', {}, h('b', {}, '계산 순도: '), p ? fmt(p.value) + ' %' : '— (주성분을 선택하세요)', p ? h('span', { class: 'small' }, `  (주성분 ${mains().join('+')} / 정량 성분 합계 ${fmt(r.total_reported, 3)} %)`) : null),
+        rec.values.main_auto ? h('div', { class: 'small flag' }, `주성분 ${rec.values.main_auto_reason || '자동 선택'} — 맞는지 확인하세요 (주성분 칸을 바꾸면 사용자 선택으로 기록됩니다).`) : null,
         h('div', { class: 'small' }, C.XRF_PURITY_FORMULA),
+        r.non_quantified.length ? h('div', { class: 'small' }, '정량되지 않은 성분: ', r.non_quantified.map((c) => `${c.component}(${C.XRF_STATUS[c.status] || c.status})`).join(', '), ' — 합계·비교에서 0 으로 쓰지 않습니다.') : null,
         h('table', { class: 'tbl', style: { marginTop: '6px', maxWidth: '700px' } }, h('tr', {}, h('th', {}, '관심 원소'), h('th', { class: 'num' }, '함량 (wt%)'), h('th', {}, '근거')),
           rec.values.interest_elements.map((el) => {
             const im = r.impurities[el];
-            return h('tr', {}, h('td', {}, el), h('td', { class: 'num' }, im ? fmt(im.value, 3) : h('span', { class: 'flag' }, '보고 없음')), h('td', { class: 'small' }, im ? im.basis : '성적서에 없음 — 0 으로 간주하지 않습니다 (검출 한계 미만일 수도 있음)'));
+            return h('tr', {}, h('td', {}, el), h('td', { class: 'num' }, im && C.isNum(im.value) ? fmt(im.value, 3) : h('span', { class: 'flag' }, im ? C.XRF_STATUS[im.status] || '값 없음' : '보고 없음')),
+              h('td', { class: 'small' }, im ? im.basis : '성적서에 없음 — 0 으로 간주하지 않습니다 (검출한계 미만일 수도 있음)'));
           }))));
     }
-    const imp = PS.importWidget({ ctx, allowPdf: true, attachRole: '성적서', label: 'XRF 성적서 (PDF 텍스트 / 캡처 OCR / 붙여넣기)', placeholder: '예)\nIrO2  97.51 %\nCl    0.12 %\nSiO2  0.50 %', onText: (text, meta) => {
-      const rows = C.parseXrf(text);
-      if (!rows.length) throw new Error('원소/화합물과 함량을 찾지 못했습니다. 표를 직접 입력하세요.');
-      comps.length = 0; comps.push(...rows); rec.values.main_components = null;
-      ctx.setSource({ method: meta.method, file_name: meta.file_name || null, edited: false });
-      ctx.applyFileDates(meta); ctx.markDirty(); renderTbl();
+    const imp = PS.importWidget({ ctx, allowPdf: true, attachRole: '성적서', label: 'XRF 성적서 (PDF / 캡처 OCR / 텍스트 붙여넣기)', placeholder: 'Rigaku SQX 성적서 PDF 는 아래 “파일 경로로 불러오기 / 파일 선택”으로 바로 읽을 수 있습니다.\n텍스트 예)\nIr  94.5 mass%\nCl  3.74 mass%\nTl  Trace', onText: (text, meta) => {
+      const rep = C.parseXrfReport(text);
+      if (!rep.rows.length) throw new Error('원소/화합물과 함량을 찾지 못했습니다. 표를 직접 입력하세요.');
+      const built = PS.xrfRecord(rep, cfg, { interest_elements: rec.values.interest_elements });
+      comps.length = 0; comps.push(...built.values.components);
+      Object.assign(rec.values, { main_components: built.values.main_components, main_auto: built.values.main_auto, main_auto_reason: built.values.main_auto_reason, report: built.values.report });
+      ctx.setSource({ method: meta.method, file_name: meta.file_name || null, edited: false, report_format: rep.format, report_sample: rep.meta.sample_name || null });
+      const dates = (rep.meta.date_analyzed ? [{ date: rep.meta.date_analyzed.date, context: `성적서 Date analyzed ${rep.meta.date_analyzed_raw}` }] : []).concat(meta.date_candidates || []);
+      ctx.applyFileDates(Object.assign({}, meta, { date_candidates: dates, file_name: meta.file_name ? `${meta.file_name} (Date analyzed)` : '성적서' }));
+      ctx.markDirty(); renderMeta(); renderTbl();
     } });
     return {
-      el: h('div', {}, imp, h('div', { class: 'note' }, 'OCR/추출 결과는 저장 전에 반드시 확인하세요. 추출하지 못한 값은 빈칸(0 아님)으로 남습니다.'),
-        h('h3', {}, '원소·성분 함량'), tblBox, h('div', { class: 'row', style: { marginTop: '8px' } }, h('label', {}, '관심 불순물 원소', help('산화물(SiO2, Na2O 등)로 보고된 경우 원소 질량분율로 환산하고 환산식을 함께 기록합니다.')), intIn), resBox),
-      afterMount: renderTbl,
+      el: h('div', {}, imp, h('div', { class: 'note' }, '추출 결과는 저장 전에 반드시 확인하세요. Trace·불검출 성분은 값이 비어 있고, 추출하지 못한 값은 빈칸으로 남습니다(0 아님).',
+        ' 여러 성적서를 한 번에 넣으려면 ', h('a', { href: '#/import/xrf' }, 'XRF 성적서 일괄 가져오기'), '를 쓰세요.'),
+      metaBox, h('h3', {}, '원소·성분 함량'), tblBox,
+      h('div', { class: 'row', style: { marginTop: '8px' } }, h('label', {}, '관심 불순물 원소', help('산화물(SiO2, Na2O 등)로 보고된 경우 원소 질량분율로 환산하고 환산식을 함께 기록합니다.')), intIn), resBox),
+      afterMount() { renderMeta(); renderTbl(); },
       collect() {
         const r = C.computeXrf(comps, mains(), rec.values.interest_elements);
-        rec.values.main_components = mains();
-        return { values: rec.values, computed: { metrics: r.metrics, details: { total_reported: r.total_reported, impurities: r.impurities, not_reported: r.not_reported, formula: C.XRF_PURITY_FORMULA } } };
+        return { values: rec.values, computed: { metrics: r.metrics, details: { total_quantified: r.total_reported, impurities: r.impurities, not_reported: r.not_reported, non_quantified: r.non_quantified,
+          formula: C.XRF_PURITY_FORMULA, main_selection: rec.values.main_auto ? `자동 선택: ${rec.values.main_auto_reason}` : '설정/사용자 선택' } } };
       },
     };
   };

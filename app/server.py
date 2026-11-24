@@ -145,10 +145,10 @@ def decode_text(raw):
 
 
 def capabilities():
-    caps = {"pdf_text": False, "ocr": False}
+    caps = {"pdf_text": True, "pdf_builtin": True, "pypdf": False, "ocr": False}
     try:
         import pypdf  # noqa: F401
-        caps["pdf_text"] = True
+        caps["pypdf"] = True
     except ImportError:
         pass
     try:
@@ -160,12 +160,17 @@ def capabilities():
 
 
 def pdf_text(raw):
+    """내장 추출기(표준 라이브러리, 장비 '인쇄→PDF' 양식에 맞춤)를 먼저 쓰고, 실패하면 pypdf 를 쓴다."""
+    import pdftext
+    try:
+        return pdftext.extract_text(raw)
+    except pdftext.PdfTextError as builtin_err:
+        err = builtin_err
     try:
         import io
         import pypdf
     except ImportError:
-        raise ApiError(501, "PDF 텍스트 추출 모듈(pypdf)이 설치되어 있지 않습니다. PDF 뷰어에서 텍스트를 복사해 붙여 넣으세요."
-                            " (설치: pip install pypdf)")
+        raise ApiError(501, f"내장 PDF 추출기로 읽지 못했습니다 ({err}). pypdf 를 설치하거나(pip install pypdf) PDF 뷰어에서 텍스트를 복사해 붙여 넣으세요.")
     reader = pypdf.PdfReader(io.BytesIO(raw))
     pages = []
     for p in reader.pages:
@@ -826,6 +831,27 @@ def api_file_read(conn, p, q, b):
     size, mtime = _stat(path)
     return {"path": path, "file_name": name, "text": text, "encoding": enc, "method": method, "size": size,
             "mtime": mtime, "date_candidates": date_candidates(text)}
+
+
+@route("POST", "/api/files/list")
+def api_file_list(conn, p, q, b):
+    """폴더 안의 파일 목록 (가져오기 후보 찾기용, 내용은 읽지 않음)."""
+    need(b, "dir")
+    d = os.path.expandvars(os.path.expanduser(b["dir"].strip().strip('"')))
+    if not os.path.isdir(d):
+        raise ApiError(404, f"폴더를 찾을 수 없습니다: {d}")
+    exts = tuple(x.lower() for x in (b.get("exts") or [".pdf"]))
+    out = []
+    walker = os.walk(d) if b.get("recursive") else [(d, [], os.listdir(d))]
+    for root, _dirs, files in walker:
+        for fn in sorted(files):
+            fp = os.path.join(root, fn)
+            if fn.lower().endswith(exts) and os.path.isfile(fp):
+                st = os.stat(fp)
+                out.append({"path": fp, "name": fn, "size": st.st_size, "mtime": st.st_mtime})
+            if len(out) >= 500:
+                break
+    return {"dir": d, "files": out, "truncated": len(out) >= 500}
 
 
 @route("POST", "/api/extract")

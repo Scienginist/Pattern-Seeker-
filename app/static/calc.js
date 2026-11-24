@@ -285,11 +285,14 @@
   };
 
   // ------------------------------------------------------------ XRF
-  C.ATOMIC = { H: 1.008, B: 10.81, C: 12.011, N: 14.007, O: 15.999, F: 18.998, Na: 22.990, Mg: 24.305, Al: 26.982, Si: 28.085, P: 30.974,
-    S: 32.06, Cl: 35.45, K: 39.098, Ca: 40.078, Ti: 47.867, V: 50.942, Cr: 51.996, Mn: 54.938, Fe: 55.845, Co: 58.933, Ni: 58.693,
-    Cu: 63.546, Zn: 65.38, Zr: 91.224, Nb: 92.906, Mo: 95.95, Ru: 101.07, Rh: 102.91, Pd: 106.42, Ag: 107.87, Sn: 118.71, Sb: 121.76,
-    Ba: 137.33, Ce: 140.12, La: 138.91, Ta: 180.95, W: 183.84, Os: 190.23, Ir: 192.22, Pt: 195.08, Au: 196.97, Pb: 207.2, Bi: 208.98,
-    Br: 79.904, I: 126.90, Ga: 69.723, Ge: 72.63, Sr: 87.62, Y: 88.906, In: 114.82, Hf: 178.49, Re: 186.21, Sc: 44.956, Li: 6.94, Cs: 132.91, Rb: 85.468, Se: 78.971, As: 74.922, Te: 127.6 };
+  // 원자량 (IUPAC 표준값, 셋째 자리)
+  C.ATOMIC = { H: 1.008, He: 4.003, Li: 6.94, Be: 9.012, B: 10.81, C: 12.011, N: 14.007, O: 15.999, F: 18.998, Ne: 20.180, Na: 22.990, Mg: 24.305,
+    Al: 26.982, Si: 28.085, P: 30.974, S: 32.06, Cl: 35.45, Ar: 39.948, K: 39.098, Ca: 40.078, Sc: 44.956, Ti: 47.867, V: 50.942, Cr: 51.996,
+    Mn: 54.938, Fe: 55.845, Co: 58.933, Ni: 58.693, Cu: 63.546, Zn: 65.38, Ga: 69.723, Ge: 72.630, As: 74.922, Se: 78.971, Br: 79.904, Kr: 83.798,
+    Rb: 85.468, Sr: 87.62, Y: 88.906, Zr: 91.224, Nb: 92.906, Mo: 95.95, Ru: 101.07, Rh: 102.91, Pd: 106.42, Ag: 107.87, Cd: 112.41, In: 114.82,
+    Sn: 118.71, Sb: 121.76, Te: 127.60, I: 126.90, Xe: 131.29, Cs: 132.91, Ba: 137.33, La: 138.91, Ce: 140.12, Pr: 140.91, Nd: 144.24, Sm: 150.36,
+    Eu: 151.96, Gd: 157.25, Tb: 158.93, Dy: 162.50, Ho: 164.93, Er: 167.26, Tm: 168.93, Yb: 173.05, Lu: 174.97, Hf: 178.49, Ta: 180.95, W: 183.84,
+    Re: 186.21, Os: 190.23, Ir: 192.22, Pt: 195.08, Au: 196.97, Hg: 200.59, Tl: 204.38, Pb: 207.2, Bi: 208.98, Th: 232.04, U: 238.03 };
 
   C.parseFormula = function (f) {
     const m = String(f).match(/^([A-Z][a-z]?\d*)+$/);
@@ -309,29 +312,85 @@
     return (C.ATOMIC[el] * comp[el]) / tot;
   };
 
-  C.parseXrf = function (text) {
+  // XRF 값 상태: quantified(정량) / trace(검출됐으나 정량 불가) / nd(불검출) / below(검출한계 미만 "<x")
+  // 정량값이 아닌 상태는 value=null 로 두며 0 으로 바꾸지 않는다.
+  C.XRF_STATUS = { quantified: '정량', trace: 'Trace', nd: '불검출', below: '검출한계 미만' };
+  C.xrfValueToken = function (tok) {
+    const t = String(tok ?? '').trim();
+    if (/^(trace|tr\.?)$/i.test(t)) return { status: 'trace', value: null };
+    if (/^(n\.?d\.?|nd|not\s*detected|-{1,3})$/i.test(t)) return { status: 'nd', value: null };
+    const lt = t.match(/^<\s*([\d.]+)/);
+    if (lt) return { status: 'below', value: null, limit: Number(lt[1]) };
+    const v = C.num(t.replace(/(mass|wt)?%$/i, ''));
+    return C.isNum(v) ? { status: 'quantified', value: v } : null;
+  };
+  const XRF_UNIT = /^((mass|wt)\s*%|%|ppm|mg\/kg)$/i;
+  const normUnit = (u) => (/ppm|mg\/kg/i.test(u || '') ? 'ppm' : '%');
+
+  // Rigaku ZSX “SQX Calculation Result” 양식
+  C.parseSqx = function (text) {
+    const T = String(text || '');
+    if (!/Component\s+Result\s+Unit/i.test(T)) return null;
+    const nf = (x) => String(x || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
+    const field = (label, stop) => {
+      const m = T.match(new RegExp('(?:^|\\s)' + label + '\\s*:[ \\t]*(.*?)[ \\t]*(?:' + (stop || '$') + ')', 'm'));
+      return m ? nf(m[1]) : '';
+    };
+    const dt = (raw) => {
+      const m = String(raw).match(/(\d{4})\s*[-./]\s*(\d{1,2})\s*[-./]\s*(\d{1,2})(?:\s+(\d{1,2}):(\d{2}))?/);
+      if (!m) return null;
+      const d = `${m[1]}-${String(m[2]).padStart(2, '0')}-${String(m[3]).padStart(2, '0')}`;
+      return { date: d, time: m[4] ? `${String(m[4]).padStart(2, '0')}:${m[5]}` : null };
+    };
+    const analyzedRaw = field('Date analyzed');
+    const firstLine = T.split(/\r?\n/).find((l) => l.trim()) || '';
+    const meta = {
+      format: 'Rigaku SQX Calculation Result',
+      sample_name: field('Sample', 'Date analyzed|$'),
+      date_analyzed: dt(analyzedRaw), date_analyzed_raw: analyzedRaw, printed: dt(firstLine),
+      application: field('Application', 'Sample type|$'), sample_type: field('Sample type'),
+      balance: field('Balance'), matching_library: field('Matching library'),
+      film_correction: field('Sample film corr\\.', 'Impurity corr|$'), impurity_correction: field('Impurity corr\\.'), file: field('File'),
+    };
     const rows = [];
-    const seen = new Set();
+    const full = /^\s*(\d+)\s+(\S+)\s+(\S+)\s+((?:mass|wt)\s*%|%|ppm)\s+([-\d.Ee+]+)\s+([A-Z][a-z]?\s*-\s*[A-Za-z]+\w*)\s+([-\d.Ee+]+)\s+([-\d.Ee+]+)\s*$/;
+    const loose = /^\s*(\d+)\s+(\S+)\s+(\S+)\s+((?:mass|wt)\s*%|%|ppm)\b\s*(.*)$/;
+    for (const line of T.split(/\r?\n/)) {
+      let m = line.match(full), r = null;
+      if (m) r = { no: +m[1], component: m[2], tok: m[3], unit_raw: m[4], det_limit: C.num(m[5]), line: m[6].replace(/\s+/g, ''), intensity: C.num(m[7]), wo_normal: C.num(m[8]) };
+      else if ((m = line.match(loose)) && C.parseFormula(m[2])) r = { no: +m[1], component: m[2], tok: m[3], unit_raw: m[4], rest: m[5] };
+      if (!r || !C.parseFormula(r.component)) continue;
+      const v = C.xrfValueToken(r.tok);
+      if (!v) continue;
+      rows.push(Object.assign({ component: r.component, value: v.value, status: v.status, unit: normUnit(r.unit_raw), source: 'extracted', line_text: line.trim().slice(0, 160) },
+        r.det_limit !== undefined ? { det_limit: r.det_limit, el_line: r.line, intensity: r.intensity, wo_normal: r.wo_normal } : {}, { row_no: r.no }));
+    }
+    const q = rows.filter((x) => x.status === 'quantified');
+    meta.result_sum = q.reduce((a, x) => a + (x.unit === 'ppm' ? x.value / 1e4 : x.value), 0);
+    const wo = rows.filter((x) => C.isNum(x.wo_normal));
+    if (wo.length) meta.wo_normal_sum = wo.reduce((a, x) => a + x.wo_normal, 0);
+    return { format: meta.format, meta, rows };
+  };
+
+  // 일반 텍스트(붙여넣기 등): 성분 다음의 첫 값 토큰을 읽는다. 단위 토큰은 건너뛰고, 그 밖의 토큰을 만나면 멈춘다.
+  C.parseXrfGeneric = function (text) {
+    const rows = [], seen = new Set();
     for (const line of String(text || '').split(/\r?\n/)) {
       const toks = line.trim().split(/[\s\t,;|]+/).filter(Boolean);
       for (let i = 0; i < toks.length - 1; i++) {
-        const comp = toks[i].replace(/[:]/g, '');
+        const comp = toks[i].replace(/:$/, '');
         if (!C.parseFormula(comp)) continue;
-        // 성분 뒤 첫 숫자를 함량으로 사용
-        let val = NaN, unit = '';
+        let v = null, unit = '%';
         for (let j = i + 1; j < Math.min(toks.length, i + 4); j++) {
-          const raw = toks[j];
-          const v = C.num(raw.replace(/(mass|wt)?%$/i, ''));
-          if (C.isNum(v)) {
-            val = v;
-            const u = (toks[j + 1] || '').toLowerCase();
-            unit = /ppm/.test(raw + u) ? 'ppm' : '%';
-            break;
-          }
+          if (XRF_UNIT.test(toks[j])) { unit = normUnit(toks[j]); continue; }
+          v = C.xrfValueToken(toks[j]);
+          if (v && XRF_UNIT.test(toks[j + 1] || '')) unit = normUnit(toks[j + 1]);
+          if (v && /ppm/i.test(toks[j])) unit = 'ppm';
+          break;
         }
-        if (C.isNum(val) && !seen.has(comp)) {
+        if (v && !seen.has(comp)) {
           seen.add(comp);
-          rows.push({ component: comp, value: val, unit, line: line.trim().slice(0, 160), source: 'extracted' });
+          rows.push({ component: comp, value: v.value, status: v.status, unit, line_text: line.trim().slice(0, 160), source: 'extracted' });
         }
         break;
       }
@@ -339,35 +398,57 @@
     return rows;
   };
 
-  C.XRF_PURITY_FORMULA = '순도(%) = Σ(주성분 함량) / Σ(보고된 모든 성분 함량) × 100';
+  C.parseXrfReport = function (text) {
+    const sqx = C.parseSqx(text);
+    if (sqx && sqx.rows.length) return sqx;
+    return { format: '일반 텍스트', meta: {}, rows: C.parseXrfGeneric(text) };
+  };
+  C.parseXrf = (text) => C.parseXrfReport(text).rows; // 이전 호출부 호환
+
+  // 주성분: 설정된 목록(예: IrO2) 중 정량된 성분. 없으면 50 % 이상인 최대 성분을 자동 제안한다(확인 필요 표시).
+  C.xrfDefaultMains = function (components, configured) {
+    const q = components.filter((c) => c.status !== 'trace' && c.status !== 'nd' && c.status !== 'below' && C.isNum(c.value));
+    const hit = q.filter((c) => (configured || []).includes(c.component)).map((c) => c.component);
+    if (hit.length) return { list: hit, auto: false };
+    const top = q.slice().sort((a, b) => b.value - a.value)[0];
+    if (top && top.unit !== 'ppm' && top.value >= 50) return { list: [top.component], auto: true, reason: `설정된 주성분(${(configured || []).join(', ') || '없음'})이 성적서에 없어 최대 성분 ${top.component} 을(를) 자동 선택` };
+    return { list: [], auto: false };
+  };
+
+  C.XRF_PURITY_FORMULA = '순도(%) = Σ(주성분 함량) / Σ(정량된 모든 성분 함량) × 100   (Trace·불검출 성분은 합계에서 제외)';
   C.computeXrf = function (components, mainList, interest) {
-    const pct = components.filter((c) => C.isNum(c.value)).map((c) => ({ ...c, pct: c.unit === 'ppm' ? c.value / 1e4 : c.value }));
+    const isQ = (c) => (c.status === undefined || c.status === 'quantified') && C.isNum(c.value);
+    const pct = components.filter(isQ).map((c) => ({ ...c, pct: c.unit === 'ppm' ? c.value / 1e4 : c.value }));
     const total = pct.reduce((s, c) => s + c.pct, 0);
     const mains = pct.filter((c) => mainList.includes(c.component));
     const metrics = {};
     if (mains.length && total > 0) {
       const mainSum = mains.reduce((s, c) => s + c.pct, 0);
       metrics.purity = { value: (mainSum / total) * 100, unit: '%', formula: C.XRF_PURITY_FORMULA,
-        inputs: { main: mains.map((c) => `${c.component}=${c.pct}`), total_reported: total } };
+        inputs: { main: mains.map((c) => `${c.component}=${c.pct}`), total_quantified: total } };
     }
     const impurities = {};
+    const nonQ = components.filter((c) => !isQ(c));
     for (const el of interest) {
-      // 원소 그대로 보고되었거나, 산화물 등 화합물로 보고되면 원소 질량분율로 환산
       const direct = pct.find((c) => c.component === el);
-      if (direct) {
-        impurities[el] = { value: direct.pct, unit: 'wt%', basis: `${el} 직접 보고값` };
-      } else {
+      const directNQ = nonQ.find((c) => c.component === el);
+      if (direct) impurities[el] = { value: direct.pct, unit: 'wt%', basis: `${el} 직접 보고값` };
+      else if (directNQ) impurities[el] = { value: null, status: directNQ.status, unit: 'wt%', basis: `${C.XRF_STATUS[directNQ.status] || directNQ.status} — 정량값 없음 (0 아님)` };
+      else {
         const compd = pct.find((c) => C.parseFormula(c.component) && C.parseFormula(c.component)[el] && c.component !== el);
         if (compd) {
           const f = C.massFraction(compd.component, el);
           impurities[el] = { value: compd.pct * f, unit: 'wt%', basis: `${compd.component} ${compd.pct} × ${f.toFixed(4)} (${el} 질량분율 환산)`, from: compd.component };
         }
       }
-      if (impurities[el]) metrics['imp_' + el] = { value: impurities[el].value, unit: 'wt%', formula: impurities[el].basis, inputs: {} };
+      if (impurities[el] && C.isNum(impurities[el].value)) metrics['imp_' + el] = { value: impurities[el].value, unit: 'wt%', formula: impurities[el].basis, inputs: {} };
     }
     return { metrics, total_reported: total, impurities, main_components: mainList, interest_elements: interest,
-      not_reported: interest.filter((el) => !impurities[el]) };
+      not_reported: interest.filter((el) => !impurities[el]), non_quantified: nonQ.map((c) => ({ component: c.component, status: c.status })) };
   };
+
+  // 성적서 샘플명과 앱 샘플명 비교용 키 (전각 → 반각, 기호·공백 무시)
+  C.nameKey = (s) => String(s || '').normalize('NFKC').toLowerCase().replace(/[^0-9a-z가-힣]/g, '');
 
   // ------------------------------------------------------------ PSA
   C.SPAN_FORMULA = 'Span = (D90 − D10) / D50';

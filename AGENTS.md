@@ -7,6 +7,7 @@
 ## 실행과 구조
 - 서버는 Python 표준 라이브러리만 씁니다(`app/server.py`). DB는 SQLite(`app/db.py`)입니다. 화면은 의존성 없는 바닐라 JS(`app/static/`)입니다.
 - 오프라인 Windows 사용이 기본입니다. 외부 CDN, 빌드 도구, 필수 pip 패키지를 추가하지 않습니다. 선택 기능(pypdf, OCR)은 없어도 앱이 동작해야 합니다.
+- PDF 텍스트는 내장 추출기 `app/pdftext.py`(표준 라이브러리, 장비 “인쇄→PDF” 양식)를 먼저 쓰고, 실패하면 pypdf를 씁니다.
 - 화면 파일의 역할:
 
   | 파일 | 역할 |
@@ -60,6 +61,8 @@
 - Cdl: (i_a − i_c)/2 대 scan rate(V/s)의 기울기(mF). ECSA = Cdl/Cs이며 추정값으로 표시합니다. BET 직접 측정값이 아닙니다.
 - XRD 피팅: Gaussian(기본 7개), Levenberg–Marquardt. 원본 XY는 바꾸지 않고 결과는 `datasets.meta.fit`에 저장합니다. 피크 표로 가져온 행은 `source='fit'`입니다.
 - BET 예측: 실측 BET ↔ Cdl/로딩 선형 보정. 학습 샘플 5개 미만이면 예측값을 표시하지 않습니다. LOO 오차, 학습 범위, 95 % 예측구간을 함께 표시하고, 범위 밖은 외삽으로 경고합니다. 예측값은 저장하지 않습니다.
+- XRF 값 상태: `quantified`(정량) / `trace` / `nd`(불검출) / `below`(검출한계 미만). 정량이 아니면 `value=null`이며 순도 합계와 비교에서 0으로 쓰지 않습니다. 순도 = Σ주성분 / Σ정량 성분 × 100. 설정된 주성분(IrO2)이 없으면 50 % 이상인 최대 성분을 자동 제안하고 `main_auto=true`로 표시합니다.
+- XRF 측정일: Rigaku SQX 성적서는 “Date analyzed”를 쓰고(`measured_on_source='file'`), 출력 시각은 쓰지 않습니다.
 - 표시는 기본 소수점 둘째 자리로 하고, 원본 정밀도는 그대로 저장합니다.
 
 ## 검증
