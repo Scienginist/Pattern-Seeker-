@@ -1,0 +1,3 @@
+-- v2: 테이블 구조 변경 없음.
+-- BET 분석 항목(단일점 비표면적, t-plot 미세기공 부피, BJH 부피, HK 등)과 XRF Metal basis 순도 설정을
+-- analysis_types.config_json 에 추가한다(db.seed_v2). 기존 항목·값은 지우거나 바꾸지 않는다.

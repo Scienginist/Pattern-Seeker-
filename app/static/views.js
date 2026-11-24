@@ -114,7 +114,7 @@
     }
     q.oninput = render; sort.onchange = render; ser.onchange = render;
     view.innerHTML = '';
-    view.append(h('div', { class: 'row' }, h('h1', { class: 'grow' }, '샘플'), h('a', { href: '#/import/xrf' }, h('button', {}, 'XRF 성적서 일괄 가져오기')), h('button', { class: 'primary', onclick: async () => {
+    view.append(h('div', { class: 'row' }, h('h1', { class: 'grow' }, '샘플'), h('a', { href: '#/import/xrf' }, h('button', {}, 'XRF 성적서 가져오기')), h('a', { href: '#/import/bet' }, h('button', {}, 'BET 보고서 가져오기')), h('button', { class: 'primary', onclick: async () => {
       const id = await sampleForm(null, samples, series);
       if (id) PS.go('#/sample/' + id);
     } }, '+ 새 샘플')),
@@ -910,112 +910,211 @@
   });
 
 
-  // ------------------------------------------------------------ XRF 성적서 일괄 가져오기
-  PS.route('/import/xrf', async (p, view) => {
-    PS.crumb([{ label: '샘플', href: '#/samples' }, { label: 'XRF 성적서 일괄 가져오기' }]);
+  // ------------------------------------------------------------ 성적서 일괄 가져오기 (XRF · BET 공용)
+  const stemOf = (n) => String(n || '').replace(/\.[^.]+$/, '').replace(/[_\s-]*(METAL|BET)$/i, '').replace(/^BET[_\s-]*/i, '');
+  const IMPORT_KINDS = {
+    XRF: {
+      title: 'XRF 성적서 일괄 가져오기',
+      intro: 'Rigaku SQX(“SQX Calculation Result”) 성적서 PDF 를 여러 개 읽어 샘플별 XRF 기록으로 저장합니다. 측정일은 “Date analyzed”, 필름 보정 여부는 측정 조건으로 저장하고, Trace·불검출 성분은 0 이 아니라 값 없음으로 저장합니다.',
+      parse(text, fileName) {
+        const rep = C.parseXrfReport(text);
+        if (!rep.rows.length) throw new Error('성분 표를 찾지 못했습니다');
+        return [{ kind: 'XRF', reportName: rep.meta.sample_name || '', names: [rep.meta.sample_name, stemOf(fileName)], rep, dupKey: rep.meta.date_analyzed_raw || null }];
+      },
+      dupOf: (m, e, fileName) => (m.source && m.source.file_name === fileName) || (e.dupKey && m.values && m.values.report && m.values.report.date_analyzed_raw === e.dupKey),
+      headers: ['분석일', '필름 보정', '순도 (Metal basis)', 'Cl', 'Si', 'Na'],
+      cells(e, cfg) {
+        const built = PS.xrfRecord(e.rep, cfg);
+        const imp = built.computed.details.impurities, pur = built.computed.metrics.purity;
+        const cell = (el) => (imp[el] ? (C.isNum(imp[el].value) ? fmt(imp[el].value, 3) : C.XRF_STATUS[imp[el].status]) : h('span', { class: 'muted' }, '보고 없음'));
+        return [e.rep.meta.date_analyzed ? e.rep.meta.date_analyzed.date : '—', PS.filmChip(e.rep.meta) || '—',
+          h('span', {}, built.values.main_components.join('+') || '—', pur ? ` ${fmt(pur.value)} %` : '', built.values.main_auto ? h('span', { class: 'flag', title: built.values.main_auto_reason }, ' (자동)') : null),
+          cell('Cl'), cell('Si'), cell('Na')];
+      },
+      build(e, cfg, fileName, method) {
+        const built = PS.xrfRecord(e.rep, cfg);
+        const da = e.rep.meta.date_analyzed;
+        return { title: `XRF ${e.rep.meta.sample_name || stemOf(fileName)}`, measured_on: da ? da.date : null, measured_on_source: da ? 'file' : 'none',
+          values: built.values, computed: built.computed, conditions: built.conditions,
+          source: { method, file_name: fileName, edited: false, report_format: e.rep.format, report_sample: e.rep.meta.sample_name || null, date_from: da ? `${fileName} (Date analyzed)` : null, imported: '성적서 일괄 가져오기' } };
+      },
+    },
+    BET: {
+      title: 'BET 보고서 일괄 가져오기',
+      intro: 'Micromeritics MicroActive 원자료 보고서(시료별 PDF)와 분석기관 결과표(여러 시료가 든 PDF)를 함께 읽습니다. 같은 시료의 원자료와 결과표 행은 하나의 기록으로 합치고, 원자료가 없는 시료는 결과표 값만 저장합니다. 원자료가 있으면 등온선과 보고서의 BET 계산 구간을 함께 저장하고 앱이 같은 구간으로 다시 계산해 검증합니다.',
+      parse(text, fileName) {
+        const ma = C.parseMicroActive(text);
+        if (ma) return [{ kind: 'raw', reportName: ma.meta.sample_name || '', names: [ma.meta.sample_name, stemOf(fileName)], ma, dupKey: ma.meta.started ? ma.meta.started.raw : null }];
+        const sm = C.parseBetSummary(text);
+        if (sm && sm.rows.length) return sm.rows.map((r) => ({ kind: 'summary', reportName: r.sample, names: [r.sample], sm, row: r, dupKey: `${sm.meta.doc_no}|${r.sample}` }));
+        throw new Error('MicroActive 보고서나 결과표 형식을 찾지 못했습니다');
+      },
+      dupOf: (m, e, fileName) => {
+        const rp = (m.values && m.values.report) || {};
+        if (e.kind === 'raw') return (m.source && m.source.file_name === fileName) || (e.dupKey && rp.meta && rp.meta.started && rp.meta.started.raw === e.dupKey);
+        return (rp.summary && `${rp.summary.doc_no}|${rp.summary.row_sample}` === e.dupKey) || (rp.meta && `${rp.meta.doc_no}|${rp.row_sample}` === e.dupKey);
+      },
+      headers: ['자료', '분석일', 'BET (보고서)', '앱 재계산', '미세기공 면적 비율', '총 기공 부피'],
+      prepare(entries) {
+        // 같은 시료의 결과표 행을 원자료에 합친다
+        for (const e of entries) {
+          if (e.kind !== 'summary') continue;
+          const raw = entries.find((x) => x.kind === 'raw' && C.nameKey(x.reportName) === C.nameKey(e.reportName));
+          if (raw) { raw.summary = e; e.mergedInto = raw; }
+        }
+      },
+      cells(e) {
+        if (e.kind === 'raw') {
+          const b = PS.betRecord(e.ma), pick = b.dataset ? PS.betSelect(b.dataset, { pmin: 0.01, pmax: 0.35, minPts: 4 }, null, b.reportRange) : null;
+          const cmp = PS.betComputed(b.values, pick, b.dataset, {}, null);
+          const sumV = e.summary && e.summary.row.values.bet_ssa && e.summary.row.values.bet_ssa.value;
+          const rep = b.values.bet_ssa && b.values.bet_ssa.value;
+          return [h('span', {}, '원자료', e.summary ? h('span', { class: 'chip', style: { marginLeft: '4px' } }, '+ 결과표') : null,
+            e.summary && C.isNum(sumV) && C.isNum(rep) && Math.abs(sumV - rep) > 1e-6 ? h('div', { class: 'flag' }, `결과표 값 ${sumV} 과 다름`) : null),
+          b.started ? b.started.date : '—', C.isNum(rep) ? fmt(rep, 4) : '—',
+          pick && pick.sel ? h('span', { title: pick.how }, fmt(pick.sel.ssa, 4), h('span', { class: 'small muted' }, ` (${pick.sel.n}점)`)) : h('span', { class: 'flag' }, '계산 안 함'),
+          cmp.metrics.micro_area_ratio ? fmt(cmp.metrics.micro_area_ratio.value, 1) + ' %' : '—', b.values.pore_volume ? fmt(b.values.pore_volume.value, 4) : '—'];
+        }
+        const v = e.row.values;
+        return [e.mergedInto ? h('span', { class: 'muted' }, '결과표 (원자료에 합침)') : h('span', {}, '결과표만', h('div', { class: 'small muted' }, '등온선 없음')), h('span', { class: 'muted', title: '결과표에는 분석일이 없습니다. 완료일자: ' + (e.sm.meta.completed || '') }, '—'),
+          v.bet_ssa ? fmt(v.bet_ssa.value, 4) : '—', '—', '—', v.pore_volume ? fmt(v.pore_volume.value, 4) : '—'];
+      },
+      skip: (e) => !!e.mergedInto,
+      build(e, cfg, fileName, method) {
+        if (e.kind === 'raw') {
+          const b = PS.betRecord(e.ma);
+          const opt = { pmin: 0.01, pmax: 0.35, minPts: 4 };
+          const pick = b.dataset ? PS.betSelect(b.dataset, opt, null, b.reportRange) : null;
+          if (e.summary) {
+            const sm = e.summary.sm;
+            b.values.report.summary = { format: sm.format, lab: sm.meta.lab, doc_no: sm.meta.doc_no, completed: sm.meta.completed, degas: sm.meta.degas, fitting_range: sm.meta.fitting_range, row_sample: e.summary.row.sample, values: e.summary.row.values };
+            if (sm.meta.degas) b.conditions.degas = { label: '전처리(탈기) 조건', value: sm.meta.degas, unit: '', source: 'file' };
+            if (sm.meta.fitting_range) b.conditions.fitting_range_nominal = { label: '보고서 BET 구간(공칭)', value: sm.meta.fitting_range, unit: 'P/Po', source: 'file' };
+            for (const [k, v] of Object.entries(e.summary.row.values)) if (!b.values[k]) b.values[k] = v;
+          }
+          return { title: `BET ${e.ma.meta.sample_name || stemOf(fileName)}`, measured_on: b.started ? b.started.date : null, measured_on_source: b.started ? 'file' : 'none',
+            values: b.values, computed: PS.betComputed(b.values, pick, b.dataset, opt, null), conditions: b.conditions,
+            datasets: b.dataset ? [Object.assign({}, b.dataset, { meta: Object.assign({}, b.dataset.meta, { options: opt, selected: null }) })] : [],
+            source: { method, file_name: fileName, edited: false, report_format: e.ma.format, report_sample: e.ma.meta.sample_name, date_from: b.started ? `${fileName} (Started)` : null,
+              summary_file: e.summary ? e.summary.fileName : null, imported: '성적서 일괄 가져오기' } };
+        }
+        const sm = e.sm, values = Object.assign({}, e.row.values);
+        values.report = { format: sm.format, meta: sm.meta, row_sample: e.row.sample };
+        const conditions = {};
+        if (sm.meta.degas) conditions.degas = { label: '전처리(탈기) 조건', value: sm.meta.degas, unit: '', source: 'file' };
+        if (sm.meta.fitting_range) conditions.fitting_range_nominal = { label: '보고서 BET 구간(공칭)', value: sm.meta.fitting_range, unit: 'P/Po', source: 'file' };
+        if (sm.meta.instrument) conditions.instrument = { label: '장비', value: sm.meta.instrument, unit: '', source: 'file' };
+        return { title: `BET ${e.row.sample} (결과표)`, measured_on: null, measured_on_source: 'none', values, computed: PS.betComputed(values, null, null, {}, null), conditions,
+          notes: `결과표만 가져옴 (등온선 원자료 없음). 완료일자 ${sm.meta.completed_raw || ''} — 분석일이 아니므로 측정일로 쓰지 않았습니다.`,
+          source: { method, file_name: fileName, edited: false, report_format: sm.format, report_sample: e.row.sample, imported: '성적서 일괄 가져오기' } };
+      },
+    },
+  };
+
+  PS.route('/import/:code', async (p, view) => {
+    const code = p.code.toUpperCase();
+    const K = IMPORT_KINDS[code];
+    if (!K) throw new Error('지원하지 않는 가져오기: ' + p.code);
+    PS.crumb([{ label: '샘플', href: '#/samples' }, { label: K.title }]);
     let samples = await loadSamples();
-    const cfg = (PS.typeMap.XRF || {}).config || {};
-    const items = []; // {name, path?, file?, status, report, error, target, newName, dup, result}
-    const dirIn = h('input', { type: 'text', placeholder: '성적서 폴더 경로 (예: D:\\보관소\\XRF\\2026-11)', style: { flex: 1, minWidth: '320px' } });
+    const cfg = (PS.typeMap[code] || {}).config || {};
+    const files = []; // {name, path?, file?, status, error, entries}
+    let entries = []; // {fileName, kind, reportName, names, target, newName, dup, result, ...}
+    const dirIn = h('input', { type: 'text', placeholder: '보고서 폴더 경로 (예: D:\\보관소\\' + code + '\\2026-11)', style: { flex: 1, minWidth: '320px' } });
     const recur = h('input', { type: 'checkbox' });
     const fileIn = h('input', { type: 'file', multiple: true, accept: '.pdf,.txt' });
     const attMode = PS.select([['link', '원본 경로만 연결 (기본)'], ['copy', '앱 폴더에 복사'], ['none', '첨부 안 함']], 'link');
     const listBox = h('div'), actBox = h('div');
-    const keyOf = (s) => C.nameKey(s);
-    const stem = (n) => String(n || '').replace(/\.[^.]+$/, '').replace(/[_\s-]*METAL$/i, '');
-    async function existingXrf() {
+    async function existing() {
       const ids = samples.map((s) => s.id);
       if (!ids.length) return [];
-      return (await PS.api.post('/metrics', { sample_ids: ids })).measurements.filter((m) => m.analysis_code === 'XRF');
+      return (await PS.api.post('/metrics', { sample_ids: ids })).measurements.filter((m) => m.analysis_code === code);
     }
     async function readAll() {
-      const xrfs = await existingXrf();
-      for (const it of items) {
-        if (it.report || it.error) continue;
-        it.status = '읽는 중';
-        render();
+      for (const f of files) {
+        if (f.status) continue;
+        f.status = '읽는 중'; render();
         try {
           let r;
-          if (it.path) r = await PS.api.post('/files/read', { path: it.path });
-          else if (/\.pdf$/i.test(it.name)) r = await PS.api.post('/extract', { file_name: it.name, content_b64: await PS.readFileAsB64(it.file) });
-          else r = { text: await PS.readFileAsText(it.file), method: 'text' };
-          it.method = r.method;
-          it.report = C.parseXrfReport(r.text);
-          if (!it.report.rows.length) throw new Error('성분 표를 찾지 못했습니다');
-          // 샘플 매칭: 성적서 샘플명 → 파일 이름 순으로 정규화 이름 일치 확인
-          const keys = [it.report.meta.sample_name, stem(it.name)].filter(Boolean).map(keyOf);
-          const hit = samples.find((s) => keys.includes(keyOf(s.name)));
-          it.target = hit ? String(hit.id) : '';
-          it.newName = (it.report.meta.sample_name || stem(it.name)).normalize('NFKC').trim();
-          const da = it.report.meta.date_analyzed;
-          it.dup = hit ? xrfs.find((m) => m.sample_id === hit.id && ((m.source && m.source.file_name === it.name) ||
-            (m.values && m.values.report && m.values.report.date_analyzed_raw && m.values.report.date_analyzed_raw === it.report.meta.date_analyzed_raw))) : null;
-          if (it.dup) it.target = '';
-          it.status = '확인 필요';
-          void da;
-        } catch (e) { it.error = e.message; it.status = '읽기 실패'; }
-        render();
+          if (f.path) r = await PS.api.post('/files/read', { path: f.path });
+          else if (/\.pdf$/i.test(f.name)) r = await PS.api.post('/extract', { file_name: f.name, content_b64: await PS.readFileAsB64(f.file) });
+          else r = { text: await PS.readFileAsText(f.file), method: 'text' };
+          f.method = r.method;
+          f.entries = K.parse(r.text, f.name).map((e) => Object.assign(e, { fileName: f.name, file: f }));
+          f.status = 'ok';
+        } catch (e) { f.error = e.message; f.status = 'error'; }
       }
+      entries = files.flatMap((f) => f.entries || []);
+      if (K.prepare) K.prepare(entries);
+      entries.forEach((e) => { if (e.summary) e.summary.fileName = e.summary.fileName || (e.summary.file && e.summary.file.name); });
+      const ex = await existing();
+      for (const e of entries) {
+        if (!e.newName) e.newName = (e.reportName || stemOf(e.fileName)).normalize('NFKC').trim();
+        if (e.target !== undefined && !(K.skip && K.skip(e))) continue;
+        if (K.skip && K.skip(e)) { e.target = ''; continue; }
+        const keys = e.names.filter(Boolean).map((n) => C.nameKey(n));
+        const hit = samples.find((s) => keys.includes(C.nameKey(s.name)));
+        e.dup = hit ? ex.find((m) => m.sample_id === hit.id && K.dupOf(m, e, e.fileName)) : null;
+        e.target = hit && !e.dup && !(K.skip && K.skip(e)) ? String(hit.id) : '';
+      }
+      render();
     }
     function render() {
       listBox.innerHTML = '';
-      if (!items.length) { listBox.appendChild(h('div', { class: 'muted' }, '폴더 경로를 넣거나 파일을 고르세요.')); actBox.innerHTML = ''; return; }
-      const tbl = h('table', { class: 'tbl small' }, h('tr', {}, h('th', {}, '파일'), h('th', {}, '성적서 샘플명'), h('th', {}, '분석일'), h('th', {}, '주성분·순도'), h('th', { class: 'num' }, 'Cl'), h('th', { class: 'num' }, 'Si'), h('th', { class: 'num' }, 'Na'),
-        h('th', {}, '저장할 샘플', help('샘플명이 정확히 맞는 샘플은 자동으로 고릅니다(전각·기호·공백 무시). 맞는 샘플이 없으면 “건너뛰기”가 기본이며, 새 샘플로 만들지 직접 고르세요.')), h('th', {}, '결과')));
-      for (const it of items) {
-        let cells = [h('td', {}, '—'), h('td', {}, '—'), h('td', {}, '—'), h('td'), h('td'), h('td')];
-        if (it.report) {
-          const built = PS.xrfRecord(it.report, cfg);
-          const imp = built.computed.details.impurities;
-          const cell = (el) => h('td', { class: 'num' }, imp[el] ? (C.isNum(imp[el].value) ? fmt(imp[el].value, 3) : C.XRF_STATUS[imp[el].status]) : h('span', { class: 'muted' }, '보고 없음'));
-          const pur = built.computed.metrics.purity;
-          cells = [h('td', {}, it.report.meta.sample_name || h('span', { class: 'muted' }, '(없음)')), h('td', {}, it.report.meta.date_analyzed ? it.report.meta.date_analyzed.date : '—'),
-            h('td', {}, built.values.main_components.join('+') || '—', pur ? ` ${fmt(pur.value)} %` : '', built.values.main_auto ? h('span', { class: 'flag', title: built.values.main_auto_reason }, ' (자동)') : null),
-            cell('Cl'), cell('Si'), cell('Na')];
-        }
-        const sel = PS.select([['', it.dup ? '건너뛰기 (이미 가져온 성적서로 보임)' : '건너뛰기']].concat([['__new', `새 샘플 만들기: ${it.newName || ''}`]]).concat(samples.map((s) => [String(s.id), s.name])), it.target || '', { disabled: !it.report || !!it.result });
-        sel.onchange = () => { it.target = sel.value; render(); };
-        const nameIn = it.target === '__new' && !it.result ? h('input', { type: 'text', value: it.newName, class: 'sm', style: { width: '140px' }, oninput: (e) => { it.newName = e.target.value; } }) : null;
-        tbl.appendChild(h('tr', {}, h('td', { title: it.path || '' }, it.name), ...cells, h('td', {}, sel, nameIn, it.dup ? h('div', { class: 'flag' }, `같은 샘플에 같은 성적서 기록 있음: `, h('a', { href: '#/m/' + it.dup.id }, '#' + it.dup.id)) : null),
-          h('td', {}, it.result ? (it.result.ok ? h('a', { href: '#/m/' + it.result.id, style: { color: '#1e8e4e' } }, '✓ 저장됨 #' + it.result.id) : h('span', { style: { color: '#c0392b' } }, '✕ ' + it.result.error))
-            : it.error ? h('span', { style: { color: '#c0392b' } }, it.error) : it.status || '')));
+      const errs = files.filter((f) => f.error);
+      if (errs.length) listBox.appendChild(h('div', { class: 'badge-bad small' }, errs.map((f) => h('div', {}, `${f.name}: ${f.error}`))));
+      const busy = files.filter((f) => f.status === '읽는 중').length;
+      if (busy) listBox.appendChild(h('div', { class: 'muted' }, `읽는 중… (${busy})`));
+      if (!entries.length) { if (!files.length) listBox.appendChild(h('div', { class: 'muted' }, '폴더 경로를 넣거나 파일을 고르세요.')); actBox.innerHTML = ''; return; }
+      const tbl = h('table', { class: 'tbl small' }, h('tr', {}, h('th', {}, '파일'), h('th', {}, '보고서 시료명'), K.headers.map((x) => h('th', {}, x)),
+        h('th', {}, '저장할 샘플', help('보고서 시료명(또는 파일 이름)이 앱 샘플명과 정확히 맞으면 자동으로 고릅니다(전각·기호·공백 무시). 맞는 샘플이 없으면 “건너뛰기”가 기본이며, 새 샘플로 만들지 직접 고르세요.')), h('th', {}, '결과')));
+      for (const e of entries) {
+        const skipped = K.skip && K.skip(e);
+        const sel = PS.select([['', e.dup ? '건너뛰기 (이미 가져온 보고서로 보임)' : skipped ? '건너뛰기 (원자료 기록에 합침)' : '건너뛰기'], ['__new', `새 샘플 만들기: ${e.newName}`]].concat(samples.map((s) => [String(s.id), s.name])),
+          e.target || '', { disabled: !!e.result || skipped });
+        sel.onchange = () => { e.target = sel.value; render(); };
+        const nameIn = e.target === '__new' && !e.result ? h('input', { type: 'text', value: e.newName, class: 'sm', style: { width: '150px' }, oninput: (ev) => { e.newName = ev.target.value; } }) : null;
+        tbl.appendChild(h('tr', { style: skipped ? { color: '#9aa1ad' } : null }, h('td', { title: e.file.path || '' }, e.fileName), h('td', {}, e.reportName || h('span', { class: 'muted' }, '(없음)')),
+          K.cells(e, cfg).map((c) => h('td', {}, c)),
+          h('td', {}, sel, nameIn, e.dup ? h('div', { class: 'flag' }, '같은 샘플에 같은 보고서 기록 있음: ', h('a', { href: '#/m/' + e.dup.id }, '#' + e.dup.id)) : null),
+          h('td', {}, e.result ? (e.result.ok ? h('a', { href: '#/m/' + e.result.id, style: { color: '#1e8e4e' } }, '✓ 저장됨 #' + e.result.id, e.result.note ? h('div', { class: 'flag' }, e.result.note) : null)
+            : h('span', { style: { color: '#c0392b' } }, '✕ ' + e.result.error)) : '확인 필요')));
       }
       listBox.appendChild(h('div', { class: 'tablewrap' }, tbl));
-      const chosen = items.filter((it) => it.report && it.target && !it.result);
+      const chosen = entries.filter((e) => e.target && !e.result);
       actBox.innerHTML = '';
       actBox.append(h('div', { class: 'row', style: { marginTop: '10px' } }, h('label', {}, '원본 첨부'), attMode,
         h('button', { class: 'primary', disabled: !chosen.length, onclick: saveAll }, `선택한 ${chosen.length}개 저장`),
-        h('span', { class: 'note' }, '저장하면 샘플별 XRF 기록이 만들어지고 상태가 “자료 있음”이 됩니다. 추출값은 “추출” 출처로 표시되며 기록 화면에서 확인·수정할 수 있습니다.')));
+        h('span', { class: 'note' }, '저장하면 샘플별 기록이 만들어지고 상태가 “자료 있음”이 됩니다. 추출값은 “추출” 출처로 표시되며 기록 화면에서 확인·수정할 수 있습니다.')));
+    }
+    async function attach(id, f, role) {
+      if (attMode.value === 'none') return;
+      const body = { measurement_id: id, mode: attMode.value, role, file_name: f.name };
+      if (f.path) body.path = f.path;
+      else if (attMode.value === 'copy') { body.mode = 'copy'; body.content_b64 = await PS.readFileAsB64(f.file); }
+      else return;
+      await PS.api.post('/attachments', body);
     }
     async function saveAll() {
-      const chosen = items.filter((it) => it.report && it.target && !it.result);
-      if (!(await PS.confirm(`${chosen.length}개 성적서를 저장할까요?`, { detail: `새 샘플 ${chosen.filter((x) => x.target === '__new').length}개가 만들어집니다. 저장 전 자동 백업을 만듭니다.` }))) return;
-      try { await PS.api.post('/backups', { reason: 'XRF 일괄 가져오기 직전 자동 백업' }); } catch (e) { if (!(await PS.confirm('백업 생성에 실패했습니다. 그래도 계속할까요?', { detail: e.message }))) return; }
-      for (const it of chosen) {
+      const chosen = entries.filter((e) => e.target && !e.result);
+      if (!(await PS.confirm(`${chosen.length}개 기록을 저장할까요?`, { detail: `새 샘플 ${chosen.filter((x) => x.target === '__new').length}개가 만들어집니다. 저장 전 자동 백업을 만듭니다.` }))) return;
+      try { await PS.api.post('/backups', { reason: `${K.title} 직전 자동 백업` }); } catch (err) { if (!(await PS.confirm('백업 생성에 실패했습니다. 그래도 계속할까요?', { detail: err.message }))) return; }
+      for (const e of chosen) {
         try {
-          let sid = it.target;
+          let sid = e.target;
           if (sid === '__new') {
-            if (!it.newName.trim()) throw new Error('새 샘플 이름이 비어 있습니다');
-            const ex = samples.find((s) => keyOf(s.name) === keyOf(it.newName));
-            sid = ex ? ex.id : (await PS.api.post('/samples', { name: it.newName.trim(), notes: `XRF 성적서 일괄 가져오기로 생성 (${it.name})` })).id;
+            if (!e.newName.trim()) throw new Error('새 샘플 이름이 비어 있습니다');
+            const ex = samples.find((s) => C.nameKey(s.name) === C.nameKey(e.newName));
+            sid = ex ? ex.id : (await PS.api.post('/samples', { name: e.newName.trim(), notes: `${K.title}로 생성 (${e.fileName})` })).id;
+            if (!ex) samples = await loadSamples();
           }
-          const built = PS.xrfRecord(it.report, cfg);
-          const da = it.report.meta.date_analyzed;
-          const id = (await PS.api.post('/measurements', {
-            sample_id: +sid, analysis_code: 'XRF', title: `XRF ${it.report.meta.sample_name || stem(it.name)}`, measured_on: da ? da.date : null, measured_on_source: da ? 'file' : 'none',
-            values: built.values, computed: built.computed, notes: '',
-            source: { method: it.method || 'pdf_text', file_name: it.name, edited: false, report_format: it.report.format, report_sample: it.report.meta.sample_name || null, date_from: da ? `${it.name} (Date analyzed)` : null, imported: 'XRF 일괄 가져오기' },
-          })).id;
-          if (attMode.value !== 'none') {
-            try {
-              const body = { measurement_id: id, mode: attMode.value, role: '성적서', file_name: it.name };
-              if (it.path) body.path = it.path;
-              else { body.mode = 'copy'; body.content_b64 = await PS.readFileAsB64(it.file); }
-              if (it.path || attMode.value === 'copy') await PS.api.post('/attachments', body);
-            } catch (e) { it.attErr = e.message; }
-          }
-          it.result = { ok: true, id, note: it.attErr ? '첨부 실패: ' + it.attErr : '' };
-        } catch (e) { it.result = { ok: false, error: e.message }; }
+          const b = K.build(e, cfg, e.fileName, e.file.method || 'pdf_text');
+          const id = (await PS.api.post('/measurements', Object.assign({ sample_id: +sid, analysis_code: code, notes: '' }, b))).id;
+          const notes = [];
+          try { await attach(id, e.file, '성적서'); } catch (err) { notes.push('첨부 실패: ' + err.message); }
+          if (e.summary && e.summary.file && e.summary.file !== e.file) { try { await attach(id, e.summary.file, '결과표'); } catch (err) { notes.push('결과표 첨부 실패: ' + err.message); } }
+          e.result = { ok: true, id, note: notes.join(' / ') };
+        } catch (err) { e.result = { ok: false, error: err.message }; }
         render();
       }
       samples = await loadSamples();
@@ -1024,24 +1123,25 @@
       render();
     }
     view.innerHTML = '';
-    view.append(h('h1', {}, 'XRF 성적서 일괄 가져오기'),
-      h('p', { class: 'note' }, 'Rigaku SQX(“SQX Calculation Result”) 성적서 PDF 를 여러 개 읽어 샘플별 XRF 기록으로 저장합니다. 측정일은 성적서의 “Date analyzed”를 쓰고, Trace·불검출 성분은 0 이 아니라 값 없음으로 저장합니다.'),
+    view.append(h('div', { class: 'row' }, h('h1', { class: 'grow' }, K.title),
+      Object.keys(IMPORT_KINDS).filter((k) => k !== code).map((k) => h('a', { href: '#/import/' + k.toLowerCase() }, IMPORT_KINDS[k].title))),
+      h('p', { class: 'note' }, K.intro),
       h('div', { class: 'panel' },
         h('div', { class: 'row' }, dirIn, h('label', {}, recur, ' 하위 폴더 포함'), h('button', { onclick: async () => {
           if (!dirIn.value.trim()) return;
           try {
             const r = await PS.api.post('/files/list', { dir: dirIn.value, recursive: recur.checked, exts: ['.pdf'] });
-            for (const f of r.files) if (!items.some((x) => x.path === f.path)) items.push({ name: f.name, path: f.path });
+            for (const f of r.files) if (!files.some((x) => x.path === f.path)) files.push({ name: f.name, path: f.path });
             if (!r.files.length) PS.toast('PDF 가 없습니다', 'bad');
             render(); await readAll();
-          } catch (e) { PS.toast(e.message, 'bad'); }
+          } catch (err) { PS.toast(err.message, 'bad'); }
         } }, '폴더에서 PDF 찾기')),
         h('div', { class: 'row', style: { marginTop: '8px' } }, fileIn, h('button', { onclick: async () => {
-          for (const f of fileIn.files) items.push({ name: f.name, file: f });
+          for (const f of fileIn.files) files.push({ name: f.name, file: f });
           fileIn.value = '';
           render(); await readAll();
         } }, '선택한 파일 추가'), h('span', { class: 'small muted' }, '브라우저에서 고른 파일은 원래 경로를 알 수 없어 “앱 폴더에 복사” 또는 첨부 없음만 가능합니다.'),
-          h('button', { class: 'small', onclick: () => { items.length = 0; render(); } }, '목록 비우기'))),
+          h('button', { class: 'small', onclick: () => { files.length = 0; entries = []; render(); } }, '목록 비우기'))),
       listBox, actBox);
     render();
   });
@@ -1152,6 +1252,32 @@
           trash.measurements.map((x) => h('div', { class: 'row small' }, h('span', { class: 'chip' }, '측정'), `${x.sample_name} · ${x.analysis_code} ${x.title || '#' + x.id}`, h('span', { class: 'muted' }, x.deleted_at.replace('T', ' ')),
             h('button', { class: 'small', onclick: async () => { try { await PS.api.post(`/measurements/${x.id}/restore`); PS.toast('복원했습니다', 'ok'); PS.refresh(); } catch (e) { PS.toast(e.message, 'bad'); } } }, '복원'))))
           : h('div', { class: 'muted' }, '휴지통이 비어 있습니다.')),
+      h('div', { class: 'panel' }, h('h2', { style: { marginTop: 0 } }, '계산 기준 갱신'),
+        h('p', { class: 'note' }, 'XRF 순도 계산 기준이 Metal basis(주성분 / (주성분 + 금속 불순물) × 100, Cl·I·S 등 비금속 제외)로 바뀌었습니다. 이전 기준으로 저장된 기록을 저장된 성분 값으로 다시 계산합니다. 성분 값은 바꾸지 않고, 바뀌기 전 계산값은 변경 이력에 남습니다.'),
+        h('button', { onclick: async () => {
+          const ss = await loadSamples();
+          const ms = ss.length ? (await PS.api.post('/metrics', { sample_ids: ss.map((x) => x.id) })).measurements.filter((m) => m.analysis_code === 'XRF') : [];
+          const cfgX = (PS.typeMap.XRF || {}).config || {};
+          const todo = ms.filter((m) => m.values && Array.isArray(m.values.components) && !(m.computed && m.computed.metrics && m.computed.metrics.purity && m.computed.metrics.purity.formula === C.XRF_PURITY_FORMULA));
+          if (!todo.length) { PS.toast('다시 계산할 XRF 기록이 없습니다', 'ok'); return; }
+          const preview = todo.map((m) => {
+            const r = C.computeXrf(m.values.components, m.values.main_components || [], m.values.interest_elements || ['Cl', 'Si', 'Na'], PS.xrfOpts(cfgX));
+            const old = m.computed && m.computed.metrics && m.computed.metrics.purity ? m.computed.metrics.purity.value : null;
+            return { m, r, old };
+          });
+          const detail = preview.slice(0, 12).map((x) => `#${x.m.id}: ${x.old !== null ? fmt(x.old) : '—'} → ${x.r.metrics.purity ? fmt(x.r.metrics.purity.value) : '—'} %`).join(', ');
+          if (!(await PS.confirm(`XRF 기록 ${todo.length}개의 순도를 Metal basis 로 다시 계산할까요?`, { detail: detail + (todo.length > 12 ? ' …' : '') + ' — 실행 전 자동 백업을 만듭니다.' }))) return;
+          await PS.api.post('/backups', { reason: 'XRF 순도 재계산(Metal basis) 직전 자동 백업' });
+          let ok = 0;
+          for (const x of preview) {
+            try {
+              await PS.api.put('/measurements/' + x.m.id, { computed: { metrics: x.r.metrics, details: Object.assign(PS.xrfDetails(x.r, (x.m.computed && x.m.computed.details && x.m.computed.details.main_selection) || '설정/사용자 선택'),
+                { recalculated: { at: new Date().toISOString(), previous_purity: x.old, previous_formula: x.m.computed && x.m.computed.metrics && x.m.computed.metrics.purity ? x.m.computed.metrics.purity.formula : null } }) } });
+              ok++;
+            } catch (err) { PS.toast(`#${x.m.id} 실패: ${err.message}`, 'bad'); }
+          }
+          PS.toast(`${ok}/${preview.length}개 다시 계산했습니다`, ok === preview.length ? 'ok' : 'bad');
+        } }, 'XRF 순도 다시 계산 (Metal basis)')),
       h('div', { class: 'panel' }, h('h2', { style: { marginTop: 0 } }, 'AI 연구 맥락 내보내기 ', help('샘플·관계·합성 단계·분석 상태·측정 조건·기록값·계산값(식 포함)·출처·연구자 해석·AI 가설을 분리된 JSON 으로 내보냅니다. 값이 없는 항목은 비워 두며 0 으로 채우지 않습니다.')),
         h('button', { onclick: async () => { const d = await PS.api.get('/export/context'); PS.download(`pattern-seeker-context-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(d, null, 1)); } }, '전체 샘플 JSON 내려받기')),
       h('div', { class: 'panel' }, h('h2', { style: { marginTop: 0 } }, '기본값'), defPanel, defBar.el),

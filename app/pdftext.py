@@ -172,22 +172,32 @@ def _page_text(content, fonts):
     leading = 0.0
     adv = 0.0  # 현재 Tm 기준 텍스트 공간 진행량
     stack = []
-    word, word_x = [], None
+    ctm = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+    gstack = []
+    word, word_x, word_end = [], None, None
+
+    def dev(x, y):
+        a, b, c, d, e, f = ctm
+        return a * x + c * y + e, b * x + d * y + f
 
     def end_word():
-        nonlocal word, word_x
+        nonlocal word, word_x, word_end
         if word and word_x is not None:
-            words.append((tm[5], word_x, "".join(word), fsize * abs(tm[3] or 1)))
-        word, word_x = [], None
+            X, Y = dev(word_x, tm[5])
+            Xe, _ = dev(word_end, tm[5])
+            size = abs(fsize * (tm[3] or 1) * (ctm[3] or 1))
+            words.append((Y, min(X, Xe), "".join(word), size, max(X, Xe)))
+        word, word_x, word_end = [], None, None
 
     def show(raw):
-        nonlocal adv, word_x
+        nonlocal adv, word_x, word_end
         for ch, w in _glyphs(raw, font):
             x = tm[4] + adv * tm[0]
             if ch.strip():
                 if word_x is None:
                     word_x = x
                 word.append(ch)
+                word_end = x + w * fsize * tm[0]
             else:
                 end_word()
             adv += w * fsize
@@ -231,7 +241,18 @@ def _page_text(content, fonts):
         else:
             op, args, stack = t, stack, []
             nums = [a[1] for a in args if a[0] == "num"]
-            if op == b"BT":
+            if op == b"q":
+                end_word(); gstack.append(ctm[:])
+            elif op == b"Q":
+                end_word()
+                if gstack:
+                    ctm = gstack.pop()
+            elif op == b"cm" and len(nums) >= 6:
+                end_word()
+                a2, b2, c2, d2, e2, f2 = nums[-6:]
+                a1, b1, c1, d1, e1, f1 = ctm
+                ctm = [a2 * a1 + b2 * c1, a2 * b1 + b2 * d1, c2 * a1 + d2 * c1, c2 * b1 + d2 * d1, e2 * a1 + f2 * c1 + e1, e2 * b1 + f2 * d1 + f1]
+            elif op == b"BT":
                 tm[:] = [1.0, 0, 0, 1.0, 0, 0]; line_start = [0.0, 0.0]; adv = 0.0
             elif op == b"ET":
                 end_word()
@@ -274,15 +295,26 @@ def _page_text(content, fonts):
     end_word()
     if not words:
         return []
-    # y 가 가까운 단어를 한 줄로 묶고 x 순으로 잇는다
+    # 기기 좌표에서 위→아래(y 큰 쪽 먼저)로 줄을 묶고, 줄 안에서는 x 순으로 잇는다.
+    # 단어 사이 실제 간격이 글자 크기의 0.15 배보다 작으면 붙여 쓴다(글자 단위 배치 PDF 대응).
     rows = []
-    for y, x, txt, size in sorted(words, key=lambda w: (w[0], w[1])):
-        tol = max(1.5, size * 0.35)
+    for y, x, txt, size, xe in sorted(words, key=lambda w: (-w[0], w[1])):
+        tol = max(1.0, size * 0.35)
         if rows and abs(rows[-1][0] - y) <= tol:
-            rows[-1][1].append((x, txt))
+            rows[-1][1].append((x, txt, size, xe))
         else:
-            rows.append([y, [(x, txt)]])
-    return [" ".join(t for _, t in sorted(cells)) for _, cells in rows]
+            rows.append([y, [(x, txt, size, xe)]])
+    lines = []
+    for _, cells in rows:
+        cells.sort()
+        out, prev_end = "", None
+        for x, txt, size, xe in cells:
+            if prev_end is not None and x - prev_end > size * 0.15:
+                out += " "
+            out += txt
+            prev_end = xe if prev_end is None else max(prev_end, xe)
+        lines.append(out)
+    return lines
 
 
 def extract_text(data):

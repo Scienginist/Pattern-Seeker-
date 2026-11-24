@@ -668,49 +668,137 @@
   };
 
   // ------------------------------------------------------------ BET
+  // ---- BET 공용: 보고서 → 기록, 구간 선택
+  const near = (a, b) => Math.abs(a - b) < 1e-7;
+  // 기본 선택: ① 사용자 선택 → ② 원자료 보고서의 BET 계산 구간(기준 만족 시) → ③ 앱 규칙(기준 만족 후보 중 R² 최고)
+  PS.betSelect = function (iso, opt, selKey, reportRange) {
+    const result = C.betRanges(iso.data[0], iso.data[1], Object.assign({}, opt, { r2min: 0.995 }));
+    const find = (r) => result.candidates.find((c) => near(c.from, r[0]) && near(c.to, r[1])) || null;
+    const reportCand = reportRange ? find(reportRange) : null;
+    let sel = null, how = '';
+    if (selKey) { sel = find([selKey.from, selKey.to]); how = selKey.override ? '기준 미달 구간 사용자 선택' : '사용자 선택'; }
+    if (!sel && reportCand && reportCand.eligible) { sel = reportCand; how = '기본 선택: 원자료 보고서의 BET 계산 구간 (기준 만족)'; }
+    if (!sel && result.selected) { sel = result.selected; how = '기본 선택: 앱 규칙 (기준 만족 후보 중 R² 최고)'; }
+    return { result, sel, how, reportCand, appRule: result.selected };
+  };
+  PS.betComputed = function (values, pick, iso, opt, selKey) {
+    const computed = { metrics: {}, details: {} };
+    const sel = pick && pick.sel;
+    if (sel) {
+      computed.metrics.bet_ssa_recalc = { value: sel.ssa, unit: 'm²/g', formula: C.BET_FORMULA, inputs: { range: [sel.from, sel.to], n: sel.n, r2: sel.r2, C: sel.C, qm: sel.qm } };
+      computed.details.bet_range = { from: sel.from, to: sel.to, n: sel.n, r2: sel.r2, C: sel.C, qm: sel.qm, slope: sel.slope, intercept: sel.intercept, selection: pick.how,
+        criteria_failed: sel.reasons, options: opt, r2_threshold: 0.995,
+        app_rule: pick.appRule ? { from: pick.appRule.from, to: pick.appRule.to, n: pick.appRule.n, ssa: pick.appRule.ssa, r2: pick.appRule.r2 } : null };
+    } else if (iso) computed.details.bet_range = { result: '기준 만족 후보 없음 — 계산하지 않음', options: opt };
+    const v = (k) => (values[k] && C.isNum(Number(values[k].value)) ? Number(values[k].value) : null);
+    if (v('tplot_micro_area') !== null && v('bet_ssa')) computed.metrics.micro_area_ratio = { value: (v('tplot_micro_area') / v('bet_ssa')) * 100, unit: '%', formula: 't-plot 미세기공 면적 / BET 비표면적(보고서) × 100', inputs: { micro: v('tplot_micro_area'), bet: v('bet_ssa') } };
+    const rb = values.report && values.report.bet_report;
+    if (rb && C.isNum(rb.C)) computed.metrics.bet_c_report = { value: rb.C, unit: '', formula: '보고서 BET 계산의 C', inputs: { range: rb.range, n: rb.n } };
+    return computed;
+  };
+  // MicroActive 보고서 파싱 결과 → values / conditions / dataset / 측정일
+  PS.betRecord = function (ma) {
+    const values = {};
+    for (const [k, e] of Object.entries(ma.values)) values[k] = e;
+    values.report = { format: ma.format, meta: ma.meta, bet_report: ma.bet_report, tplot: ma.tplot };
+    const m = ma.meta, cond = {};
+    const put = (k, label, v) => { if (v) cond[k] = { label, value: v, unit: '', source: 'file' }; };
+    put('instrument', '장비', m.instrument); put('adsorptive', '흡착 기체', m.adsorptive); put('bath_temp', '분석 bath 온도', m.bath_temp);
+    put('sample_mass', '시료 질량', m.sample_mass); put('equilibration', '평형 간격', m.equilibration); put('auto_degas', '장비 자동 탈기', m.automatic_degas);
+    put('thermal_correction', 'Thermal correction', m.thermal_correction);
+    const I = ma.isotherm;
+    const dataset = I.p.length ? { name: 'BET 등온선', columns: ['p/p0', 'Q (cm³/g STP)', '절대압 (mmHg)', '포화압 (mmHg)'], data: [I.p, I.q, I.pabs, I.po],
+      meta: { n_ads: I.n_ads, n_des: I.n_des, source: ma.format, file: m.file } } : null;
+    return { values, conditions: cond, dataset, started: m.started, reportRange: ma.bet_report && ma.bet_report.range };
+  };
+
   PS.tools.bet = function (ctx) {
     const { rec, cfg } = ctx;
     const vf = valueFields(ctx, cfg.fields, () => renderDiff());
-    const extractInfo = h('div');
+    const extractInfo = h('div'), reportBox = h('div');
     const diffBox = h('div', { class: 'small', style: { marginTop: '6px' } });
-    const imp = PS.importWidget({ ctx, allowPdf: true, attachRole: '성적서', label: 'BET 보고서 (PDF 텍스트 / 붙여넣기)', placeholder: 'BET 보고서 PDF 의 텍스트를 붙여 넣거나, 아래에서 PDF 경로/파일을 선택하세요.', onText: (text, meta) => {
+    let iso = rec.datasets.find((d) => d.name === 'BET 등온선') || null;
+    const opt = Object.assign({ pmin: 0.01, pmax: 0.35, minPts: 4 }, (iso && iso.meta && iso.meta.options) || {});
+    let selKey = iso && iso.meta && iso.meta.selected ? iso.meta.selected : null; // {from,to,override}
+    let pick = null;
+    const reportRange = () => (rec.values.report && rec.values.report.bet_report && rec.values.report.bet_report.range) || null;
+    function setValues(entries) { for (const [k, e] of Object.entries(entries)) if (e) vf.set(k, e); }
+    function applyCond(cond) { for (const [k, c] of Object.entries(cond || {})) rec.conditions[k] = c; ctx.renderConditions && ctx.renderConditions(); }
+    function renderReport() {
+      reportBox.innerHTML = '';
+      const r = rec.values.report;
+      if (!r) return;
+      const m = r.meta || {};
+      const rows = r.format && /MicroActive/.test(r.format)
+        ? [['양식', r.format], ['보고서 시료명', m.sample_name], ['장비', m.instrument], ['분석 시작', m.started && `${m.started.date} ${m.started.time || ''}`], ['분석 완료', m.completed && `${m.completed.date} ${m.completed.time || ''}`],
+          ['시료 질량', m.sample_mass], ['원본 파일(SMP)', m.file],
+          ['보고서 BET 계산', r.bet_report && r.bet_report.range ? `p/p0 ${fmt(r.bet_report.range[0], 4)}–${fmt(r.bet_report.range[1], 4)} (${r.bet_report.n}점), C = ${fmt(r.bet_report.C, 1)}, 상관계수 ${r.bet_report.corr}, Qm = ${r.bet_report.qm}` : ''],
+          ['t-plot', r.tplot && r.tplot.thickness_range ? `두께 ${r.tplot.thickness_range[0]}–${r.tplot.thickness_range[1]} ${r.tplot.thickness_range[2]}, ${r.tplot.equation || ''}` : '']]
+        : [['양식', r.format], ['분석기관', m.lab], ['문서번호', m.doc_no], ['완료일자', m.completed_raw], ['전처리', m.degas], ['BET 구간(공칭)', m.fitting_range], ['결과표 시료명', r.row_sample]];
+      reportBox.append(h('div', { class: 'kv', style: { marginBottom: '8px' } }, rows.filter((x) => x[1]).flatMap(([k, v]) => [h('span', {}, k), h('span', {}, v)])));
+      const nameIn = m.sample_name || r.row_sample;
+      if (nameIn && C.nameKey(nameIn) !== C.nameKey(ctx.sample.name)) reportBox.append(h('div', { class: 'badge-warn small' }, `보고서 시료명 “${nameIn}” 이(가) 앱 샘플명 “${ctx.sample.name}” 과(와) 다릅니다. 맞는 샘플인지 확인하세요.`));
+    }
+    const imp = PS.importWidget({ ctx, allowPdf: true, attachRole: '성적서', label: 'BET 보고서 (Micromeritics 원자료 보고서 PDF · 분석기관 결과표 PDF · 텍스트)', placeholder: 'MicroActive 보고서 PDF 는 아래 “파일 경로로 불러오기 / 파일 선택”으로 바로 읽습니다. 요약·등온선·BET 계산 구간을 한 번에 가져옵니다.', onText: (text, meta) => {
+      extractInfo.innerHTML = '';
+      const ma = C.parseMicroActive(text);
+      if (ma) {
+        const b = PS.betRecord(ma);
+        setValues(b.values); rec.values.report = b.values.report; applyCond(b.conditions);
+        if (b.dataset) { iso = b.dataset; selKey = null; }
+        ctx.setSource({ method: meta.method, file_name: meta.file_name || null, edited: false, report_format: ma.format, report_sample: ma.meta.sample_name });
+        ctx.applyFileDates(Object.assign({}, meta, { file_name: `${meta.file_name || '보고서'} (Started)`, date_candidates: (b.started ? [{ date: b.started.date, context: `분석 시작 ${b.started.raw}` }] : []).concat(meta.date_candidates || []) }));
+        extractInfo.append(h('div', { class: 'badge-ok small' }, `${ma.format}: 요약 ${Object.keys(ma.values).length}개 항목, 등온선 ${ma.isotherm.n_ads}+${ma.isotherm.n_des}점(흡착+탈착), 보고서 BET 계산 구간 ${ma.bet_report.n || 0}점을 가져왔습니다. 저장 전에 확인하세요.`));
+        renderReport(); analyze(); return;
+      }
+      const sm = C.parseBetSummary(text);
+      if (sm && sm.rows.length) {
+        const key = C.nameKey(ctx.sample.name);
+        let row = sm.rows.find((r) => C.nameKey(r.sample) === key);
+        const apply = (r) => {
+          setValues(r.values);
+          rec.values.report = { format: sm.format, meta: sm.meta, row_sample: r.sample };
+          if (sm.meta.degas) applyCond({ degas: { label: '전처리(탈기) 조건', value: sm.meta.degas, unit: '', source: 'file' } });
+          if (sm.meta.fitting_range) applyCond({ fitting_range_nominal: { label: '보고서 BET 구간(공칭)', value: sm.meta.fitting_range, unit: 'P/Po', source: 'file' } });
+          ctx.setSource({ method: meta.method, file_name: meta.file_name || null, edited: false, report_format: sm.format, report_sample: r.sample });
+          renderReport(); renderDiff();
+        };
+        if (row) { apply(row); extractInfo.append(h('div', { class: 'badge-ok small' }, `결과표에서 “${row.sample}” 행을 가져왔습니다 (등온선 원자료는 결과표에 없습니다).`)); }
+        else {
+          const sel = PS.select([['', '이 샘플에 해당하는 행 선택…']].concat(sm.rows.map((r, i) => [i, r.sample])), '');
+          sel.onchange = () => { if (sel.value !== '') { apply(sm.rows[+sel.value]); sel.disabled = true; } };
+          extractInfo.append(h('div', { class: 'badge-warn small' }, `결과표에 ${sm.rows.length}개 시료가 있지만 샘플명 “${ctx.sample.name}” 과 정확히 맞는 행이 없습니다. `, sel));
+        }
+        return;
+      }
       const r = C.parseBetReport(text);
-      const found = Object.keys(r);
-      for (const k of found) vf.set(k, r[k]);
-      const missing = cfg.fields.filter((f) => !r[f.key]).map((f) => f.label);
+      setValues(r);
       ctx.setSource({ method: meta.method, file_name: meta.file_name || null, edited: false });
       ctx.applyFileDates(meta);
-      extractInfo.innerHTML = '';
-      extractInfo.append(h('div', { class: found.length ? 'badge-ok small' : 'badge-warn small' }, `추출 ${found.length}개 항목. 저장 전에 값과 근거를 확인하세요.`,
+      const missing = cfg.fields.filter((f) => !r[f.key]).map((f) => f.label);
+      extractInfo.append(h('div', { class: Object.keys(r).length ? 'badge-ok small' : 'badge-warn small' }, `추출 ${Object.keys(r).length}개 항목. 저장 전에 값과 근거를 확인하세요.`,
         missing.length ? ` 추출하지 못한 항목: ${missing.join(', ')} (0 이 아니라 빈칸으로 남습니다)` : ''));
       renderDiff();
     } });
 
     // 구간 검토
-    let iso = rec.datasets.find((d) => d.name === 'BET 등온선') || null;
-    const opt = Object.assign({ pmin: 0.01, pmax: 0.35, minPts: 4 }, (iso && iso.meta && iso.meta.options) || {});
-    let selKey = iso && iso.meta && iso.meta.selected ? iso.meta.selected : null; // {from,to,override}
-    let result = null;
     const candBox = h('div'), chartIso = h('div'), chartBet = h('div'), selBox = h('div');
     const pminIn = numInput(opt.pmin, (v) => { if (v !== null) { opt.pmin = v; ctx.markDirty(); analyze(); } }, { class: 'sm' });
     const pmaxIn = numInput(opt.pmax, (v) => { if (v !== null) { opt.pmax = v; ctx.markDirty(); analyze(); } }, { class: 'sm' });
     const minIn = numInput(opt.minPts, (v) => { if (v !== null && v >= 3) { opt.minPts = Math.round(v); ctx.markDirty(); analyze(); } }, { class: 'sm' });
-    const isoImp = PS.importWidget({ ctx, label: '등온선 데이터 (p/p0, 흡착량 cm³/g STP)', onText: (text, meta) => {
+    const isoImp = PS.importWidget({ ctx, label: '등온선 데이터만 따로 넣기 (p/p0, 흡착량 cm³/g STP)', onText: (text, meta) => {
       const p = C.parseXY(text);
       if (p.x.length < 4) throw new Error('p/p0 와 흡착량 2열을 찾지 못했습니다');
       iso = { name: 'BET 등온선', columns: ['p/p0', 'Q (cm³/g STP)'], data: [p.x, p.y], meta: { file_name: meta.file_name || null } };
       selKey = null; ctx.markDirty(); analyze();
     } });
-    function selected() {
-      if (!result) return null;
-      if (selKey) return result.candidates.find((c) => Math.abs(c.from - selKey.from) < 1e-9 && Math.abs(c.to - selKey.to) < 1e-9) || null;
-      return result.selected;
-    }
+    const selected = () => (pick ? pick.sel : null);
     function analyze() {
       candBox.innerHTML = ''; selBox.innerHTML = ''; chartIso.innerHTML = ''; chartBet.innerHTML = '';
-      if (!iso) { candBox.appendChild(h('div', { class: 'muted small' }, '등온선 데이터를 넣으면 후보 구간을 계산합니다.')); return; }
-      result = C.betRanges(iso.data[0], iso.data[1], Object.assign({}, opt, { r2min: 0.995 }));
-      const sel = selected();
+      if (!iso) { pick = null; candBox.appendChild(h('div', { class: 'muted small' }, '등온선 데이터가 있으면 후보 구간을 계산합니다. MicroActive 보고서 PDF 를 넣으면 등온선도 함께 들어옵니다.')); renderDiff(); return; }
+      pick = PS.betSelect(iso, opt, selKey, reportRange());
+      const { result } = pick;
+      const sel = pick.sel;
       if (!result.eligible.length) {
         const cnt = {};
         result.candidates.forEach((c) => c.reasons.forEach((r) => { const k = r.replace(/[\d.]+/g, '#'); cnt[k] = (cnt[k] || 0) + 1; }));
@@ -720,14 +808,24 @@
       }
       if (sel) {
         selBox.appendChild(h('div', { class: sel.eligible ? 'badge-ok' : 'badge-warn' },
-          h('b', {}, `선택 구간 p/p0 ${fmt(sel.from, 3)}–${fmt(sel.to, 3)} (${sel.n}점): `),
-          `S(BET, 앱 재계산) = ${fmt(sel.ssa)} m²/g, C = ${fmt(sel.C, 1)}, R² = ${sel.r2.toFixed(5)}, Qm = ${fmt(sel.qm, 3)} cm³/g`,
-          selKey ? ' · 사용자 선택' : ' · 기본 선택 (기준 만족 후보 중 R² 최고)',
-          sel.eligible ? '' : ` · 기준 미달 구간을 사용자가 직접 선택함: ${sel.reasons.join('; ')}`));
+          h('b', {}, `선택 구간 p/p0 ${fmt(sel.from, 4)}–${fmt(sel.to, 4)} (${sel.n}점): `),
+          `S(BET, 앱 재계산) = ${fmt(sel.ssa)} m²/g, C = ${fmt(sel.C, 1)}, R² = ${sel.r2.toFixed(6)}, Qm = ${fmt(sel.qm, 3)} cm³/g · ${pick.how}`,
+          sel.eligible ? '' : ` · ${sel.reasons.join('; ')}`));
+      }
+      const rr = reportRange();
+      if (rr) {
+        const rc = pick.reportCand;
+        selBox.appendChild(h('div', { class: 'small', style: { marginTop: '6px' } }, h('b', {}, '보고서 구간 검증: '),
+          rc ? `p/p0 ${fmt(rr[0], 4)}–${fmt(rr[1], 4)} (${rc.n}점)을 앱이 다시 계산하면 ${fmt(rc.ssa, 4)} m²/g, C = ${fmt(rc.C, 2)} — ${rc.eligible ? '기준 만족' : '기준 미달: ' + rc.reasons.join('; ')}`
+            : '보고서 구간과 같은 점 묶음을 등온선에서 찾지 못했습니다 (p/p0 범위 설정을 확인하세요).'));
+      }
+      if (pick.appRule && sel !== pick.appRule) {
+        const a = pick.appRule;
+        selBox.appendChild(h('div', { class: 'small muted' }, `참고 — 앱 규칙(기준 만족 후보 중 R² 최고): p/p0 ${fmt(a.from, 4)}–${fmt(a.to, 4)} (${a.n}점), ${fmt(a.ssa)} m²/g, R² ${a.r2.toFixed(7)}. 점이 적은 구간일수록 R² 가 쉽게 높아집니다.`));
       }
       const tbl = h('table', { class: 'tbl' }, h('tr', {}, h('th'), h('th', {}, 'p/p0 구간'), h('th', { class: 'num' }, '점 수'), h('th', { class: 'num' }, 'R²'), h('th', { class: 'num' }, 'BET C'),
         h('th', { class: 'num' }, '비표면적 (m²/g)'), h('th', {}, '판정')));
-      const list = result.candidates.slice().sort((a, b) => (b.eligible - a.eligible) || (b.r2 - a.r2));
+      const list = result.candidates.slice().sort((a, b) => ((b === pick.reportCand) - (a === pick.reportCand)) || (b.eligible - a.eligible) || (b.r2 - a.r2));
       for (const c of list.slice(0, 200)) {
         const isSel = sel === c;
         const rb = h('input', { type: 'radio', name: 'betsel', checked: isSel });
@@ -735,20 +833,22 @@
           if (!c.eligible && !(await PS.confirm('기준을 만족하지 않는 구간입니다. 그래도 선택할까요?', { detail: c.reasons.join(' / ') + ' — 선택하면 기록에 “기준 미달 구간 사용자 선택”으로 남습니다.' }))) { analyze(); return; }
           selKey = { from: c.from, to: c.to, override: !c.eligible }; ctx.markDirty(); analyze();
         };
-        tbl.appendChild(h('tr', { style: c.eligible ? (isSel ? { background: '#eef5ff' } : null) : { color: '#9aa1ad' } }, h('td', {}, rb), h('td', {}, `${fmt(c.from, 3)} – ${fmt(c.to, 3)}`), h('td', { class: 'num' }, c.n),
-          h('td', { class: 'num' }, c.r2.toFixed(5)), h('td', { class: 'num' }, fmt(c.C, 1)), h('td', { class: 'num' }, c.eligible || isSel ? fmt(c.ssa) : fmt(c.ssa)),
+        tbl.appendChild(h('tr', { style: c.eligible ? (isSel ? { background: '#eef5ff' } : null) : { color: '#9aa1ad' } }, h('td', {}, rb),
+          h('td', {}, `${fmt(c.from, 4)} – ${fmt(c.to, 4)}`, c === pick.reportCand ? h('span', { class: 'chip', style: { marginLeft: '6px' } }, '보고서 구간') : null, c === pick.appRule ? h('span', { class: 'chip', style: { marginLeft: '6px' } }, '앱 규칙') : null),
+          h('td', { class: 'num' }, c.n), h('td', { class: 'num' }, c.r2.toFixed(6)), h('td', { class: 'num' }, fmt(c.C, 1)), h('td', { class: 'num' }, fmt(c.ssa)),
           h('td', { class: 'small' }, c.eligible ? '기준 만족' : c.reasons.join('; '))));
       }
       candBox.append(h('div', { class: 'small muted' }, `흡착 분지 ${result.adsorptionPoints}점 중 p/p0 ${opt.pmin}–${opt.pmax} 범위에서 후보 ${result.candidates.length}개, 기준 만족 ${result.eligible.length}개. (최대 200개 표시)`),
         h('div', { class: 'tablewrap', style: { maxHeight: '320px' } }, tbl));
-      // 그래프
       const P = iso.data[0], Q = iso.data[1];
-      PSChart.render(chartIso, { series: [{ name: '흡착 등온선', color: ctx.sample.color, x: P, y: Q, mode: 'both', r: 2.5 }], xLabel: 'p/p0', yLabel: 'Q (cm³/g STP)',
-        bands: sel ? [{ from: sel.from, to: sel.to }] : [], height: 260 });
+      const na = (iso.meta && iso.meta.n_ads) || P.length;
+      const series = [{ name: '흡착', color: ctx.sample.color, x: P.slice(0, na), y: Q.slice(0, na), mode: 'both', r: 2.2 }];
+      if (na < P.length) series.push({ name: '탈착', color: ctx.sample.color, dash: '5 3', x: P.slice(na), y: Q.slice(na), mode: 'both', r: 1.8, opacity: 0.7 });
+      PSChart.render(chartIso, { series, xLabel: 'p/p0', yLabel: 'Q (cm³/g STP)', bands: sel ? [{ from: sel.from, to: sel.to }] : [], height: 260 });
       if (sel) {
         const xs = sel.idx.map((i) => P[i]), ys = sel.idx.map((i) => 1 / (Q[i] * (1 / P[i] - 1)));
         const fx = [sel.from, sel.to];
-        PSChart.render(chartBet, { series: [{ name: 'BET 변환 점', color: ctx.sample.color, x: xs, y: ys, mode: 'points' }, { name: `직선 맞춤 (R² ${sel.r2.toFixed(4)})`, color: '#333', dash: '5 4', x: fx, y: fx.map((x) => sel.slope * x + sel.intercept) }],
+        PSChart.render(chartBet, { series: [{ name: 'BET 변환 점', color: ctx.sample.color, x: xs, y: ys, mode: 'points' }, { name: `직선 맞춤 (R² ${sel.r2.toFixed(5)})`, color: '#333', dash: '5 4', x: fx, y: fx.map((x) => sel.slope * x + sel.intercept) }],
           xLabel: 'p/p0', yLabel: '1 / [Q(p0/p − 1)]', height: 260 });
       }
       renderDiff();
@@ -757,36 +857,32 @@
       diffBox.innerHTML = '';
       const rep = rec.values.bet_ssa && rec.values.bet_ssa.value;
       const sel = selected();
-      if (C.isNum(rep) && sel && sel.eligible !== undefined) {
+      if (C.isNum(rep) && sel) {
         const d = ((sel.ssa - rep) / rep) * 100;
-        diffBox.append(`보고서 값 ${fmt(rep)} m²/g  vs  앱 재계산 ${fmt(sel.ssa)} m²/g (차이 ${fmt(d, 1)} %). 두 값은 출처가 다르므로 따로 저장·표시됩니다.`);
+        diffBox.append(`보고서 값 ${fmt(rep, 4)} m²/g  vs  앱 재계산 ${fmt(sel.ssa, 4)} m²/g (차이 ${fmt(d, 2)} %). 두 값은 출처가 다르므로 따로 저장·표시됩니다.`);
       }
+      const t = rec.values.tplot_micro_area && rec.values.tplot_micro_area.value, b = rec.values.bet_ssa && rec.values.bet_ssa.value;
+      if (C.isNum(t) && C.isNum(b) && t / b > 0.5) diffBox.append(h('div', { class: 'badge-warn small', style: { marginTop: '6px' } }, `미세기공 면적이 BET 비표면적의 ${fmt((t / b) * 100, 1)} % 인 미세기공성 시료입니다. 이런 시료의 BET 값은 계산 구간 선택에 민감하므로 보고서 구간과 앱 재계산을 함께 확인하세요.`));
     }
     const el = h('div', {},
-      h('h3', {}, '보고서 값'), imp, extractInfo, vf.el, diffBox,
+      h('h3', {}, '보고서 값'), imp, extractInfo, reportBox, vf.el, diffBox,
       h('p', { class: 'note' }, 'PDF 전체를 앱에 복사하지 않습니다. 보고서 그래프는 아래 “원본 파일·첨부”에서 역할을 “보고서 그래프”로 지정해 연결하거나 복사하세요.'),
       h('h3', {}, 'BET 구간 검토 ', help('BET 식은 단분자층 형성 구간에서만 성립합니다. 어떤 p/p0 구간을 쓰느냐에 따라 비표면적이 달라지므로, 후보 구간마다 R², C 값, 계산 비표면적을 함께 비교합니다.')),
       h('details', {}, h('summary', {}, '구간 검토가 무엇을 의미하나요?'),
         h('div', { class: 'note' },
           h('p', {}, '• 후보 구간: 흡착 분지에서 연속된 점들의 모든 구간(최소 점 수 이상)을 BET 직선식에 맞춥니다.'),
           h('p', {}, '• 기본 선택에서 제외하는 구간: R² < 0.995, 절편 ≤ 0 또는 C ≤ 0(물리적으로 의미 없음), Q(1−p/p0)가 감소하기 시작한 점을 포함(Rouquerol 기준 1), 단분자층 p/p0 = 1/(√C+1)이 구간 밖(Rouquerol 기준 3).'),
-          h('p', {}, '• 기본 선택: 위 기준을 모두 만족하는 후보 중 R² 가 가장 높은 구간. 점이 많다는 이유만으로 좋은 구간으로 보지 않습니다. 점이 적으면 R² 가 쉽게 높아지므로 최소 점 수(기본 4)를 함께 봅니다.'),
+          h('p', {}, '• 기본 선택 순서: 사용자가 고른 구간 → 원자료 보고서의 BET 계산 구간(기준을 만족할 때) → 앱 규칙(기준 만족 후보 중 R² 최고). 점이 적은 구간은 R² 가 쉽게 높아지므로, 보고서 구간이 있으면 그것을 먼저 씁니다.'),
           h('p', {}, '• 기준을 만족하는 구간이 없으면 숫자를 만들지 않고 이유를 보여줍니다.'),
           h('p', {}, '• S = Qm × N_A × 0.162 nm² / 22414 cm³ (N₂ 단면적 0.162 nm² 가정).'))),
-      isoImp,
+      h('details', {}, h('summary', {}, '등온선 데이터만 따로 넣기'), isoImp),
       h('div', { class: 'row', style: { margin: '6px 0' } }, h('label', {}, 'p/p0 최소'), pminIn, h('label', {}, '최대'), pmaxIn, h('label', {}, '최소 점 수'), minIn, h('span', { class: 'muted small' }, 'R² 기준 0.995')),
       selBox, candBox, h('div', { class: 'grid2' }, chartIso, chartBet));
     return {
       el,
-      afterMount: analyze,
+      afterMount() { renderReport(); analyze(); },
       collect() {
-        const computed = { metrics: {}, details: {} };
-        const sel = selected();
-        if (sel) {
-          computed.metrics.bet_ssa_recalc = { value: sel.ssa, unit: 'm²/g', formula: C.BET_FORMULA, inputs: { range: [sel.from, sel.to], n: sel.n, r2: sel.r2, C: sel.C, qm: sel.qm } };
-          computed.details.bet_range = { from: sel.from, to: sel.to, n: sel.n, r2: sel.r2, C: sel.C, qm: sel.qm, slope: sel.slope, intercept: sel.intercept,
-            selection: selKey ? (selKey.override ? '기준 미달 구간 사용자 선택' : '사용자 선택') : '기본 선택(기준 만족 후보 중 R² 최고)', criteria_failed: sel.reasons, options: opt, r2_threshold: 0.995 };
-        } else if (iso) computed.details.bet_range = { result: '기준 만족 후보 없음 — 계산하지 않음', options: opt };
+        const computed = PS.betComputed(rec.values, pick, iso, opt, selKey);
         const datasets = iso ? [Object.assign({}, iso, { meta: Object.assign({}, iso.meta, { options: opt, selected: selKey }) })] : [];
         return { values: rec.values, computed, datasets };
       },
@@ -802,10 +898,30 @@
     const dm = overrides.main_components ? { list: overrides.main_components, auto: !!overrides.main_auto } : C.xrfDefaultMains(comps, cfg.main_components || []);
     const values = { components: comps, main_components: dm.list, main_auto: !!dm.auto, main_auto_reason: dm.reason || null, interest_elements: interest,
       report: Object.assign({}, report.meta, { format: report.format }) };
-    const r = C.computeXrf(comps, dm.list, interest);
-    const computed = { metrics: r.metrics, details: { total_quantified: r.total_reported, impurities: r.impurities, not_reported: r.not_reported, non_quantified: r.non_quantified,
-      formula: C.XRF_PURITY_FORMULA, main_selection: dm.auto ? `자동 선택: ${dm.reason}` : '설정/사용자 선택' } };
-    return { values, computed };
+    const r = C.computeXrf(comps, dm.list, interest, PS.xrfOpts(cfg));
+    const computed = { metrics: r.metrics, details: PS.xrfDetails(r, dm.auto ? `자동 선택: ${dm.reason}` : '설정/사용자 선택') };
+    return { values, computed, conditions: PS.xrfConditions(report.meta || {}) };
+  };
+  PS.xrfOpts = (cfg) => ({ basis: cfg.purity_basis || 'metal', exclude: cfg.metal_basis_exclude || C.NONMETALS });
+  PS.xrfDetails = (r, mainSel) => ({ total_quantified: r.total_reported, purity_breakdown: r.purity, impurities: r.impurities, not_reported: r.not_reported,
+    non_quantified: r.non_quantified, formula: r.metrics.purity ? r.metrics.purity.formula : C.XRF_PURITY_FORMULA, main_selection: mainSel });
+  // 필름 보정·Impurity 보정·Application 은 측정 조건으로 저장 → 비교 화면에서 조건 차이로 드러난다
+  PS.xrfConditions = function (m) {
+    const cond = {};
+    if (m.format && /SQX/.test(m.format)) {
+      cond.film_correction = { label: 'XRF 필름 보정', value: m.film_label || (m.film_correction ? `있음 (${m.film_correction})` : '없음'), unit: '', source: 'file' };
+      cond.impurity_correction = { label: 'Impurity 보정', value: m.impurity_correction || '없음', unit: '', source: 'file' };
+      if (m.application) cond.application = { label: 'Application', value: m.application, unit: '', source: 'file' };
+      if (m.sample_type) cond.sample_type = { label: 'Sample type', value: m.sample_type, unit: '', source: 'file' };
+    }
+    return cond;
+  };
+  PS.filmChip = function (m) {
+    if (!m || !m.format || !/SQX/.test(m.format)) return null;
+    const on = m.film_corrected !== undefined ? m.film_corrected : !!m.film_correction;
+    return h('span', { class: 'chip', style: on ? { background: '#e6eefc', color: '#234f99', borderColor: '#bcd1f2', fontWeight: 600 } : { background: '#f4f5f7', color: '#555' },
+      title: '필름 보정 여부에 따라 함량과 검출한계가 조금 달라질 수 있습니다. 보정 여부가 다른 측정은 비교에서 조건 차이로 표시됩니다.' },
+    on ? `필름 보정 있음 · ${m.film_correction}` : '필름 보정 없음');
   };
 
   PS.tools.xrf = function (ctx) {
@@ -826,7 +942,8 @@
         ['출력 일시', m.printed ? `${m.printed.date} ${m.printed.time || ''}` : ''], ['Application', m.application], ['Sample type', m.sample_type], ['Balance', m.balance || '(없음)'],
         ['Sample film corr.', m.film_correction], ['Impurity corr.', m.impurity_correction || '(없음)'],
         ['Result 합계', C.isNum(m.result_sum) ? fmt(m.result_sum, 3) + ' %' : ''], ['w/o normal 합계', C.isNum(m.wo_normal_sum) ? fmt(m.wo_normal_sum, 3) + ' % (정규화 전)' : '']].filter((r) => r[1]);
-      metaBox.append(h('div', { class: 'kv', style: { marginBottom: '8px' } }, rows.flatMap(([k, v]) => [h('span', {}, k), h('span', {}, v)])));
+      metaBox.append(h('div', { class: 'row', style: { marginBottom: '6px' } }, PS.filmChip(m), help('“Sample film corr.” 칸에 필름 이름이 있으면 필름 보정을 한 측정입니다. 비산되는 시료에 분석자 재량으로 씁니다.')),
+        h('div', { class: 'kv', style: { marginBottom: '8px' } }, rows.flatMap(([k, v]) => [h('span', {}, k), h('span', {}, v)])));
       if (m.sample_name && C.nameKey(m.sample_name) !== C.nameKey(ctx.sample.name)) {
         metaBox.append(h('div', { class: 'badge-warn small' }, `성적서의 샘플명 “${m.sample_name}” 이(가) 앱 샘플명 “${ctx.sample.name}” 과(와) 다릅니다. 맞는 샘플의 성적서인지 확인하세요.`));
       }
@@ -857,13 +974,18 @@
       renderRes();
     }
     function renderRes() {
-      const r = C.computeXrf(comps, mains(), rec.values.interest_elements);
+      const r = C.computeXrf(comps, mains(), rec.values.interest_elements, PS.xrfOpts(cfg));
       resBox.innerHTML = '';
-      const p = r.metrics.purity;
+      const p = r.metrics.purity, pb = r.purity || {};
       resBox.append(h('div', { class: 'badge-info' },
-        h('div', {}, h('b', {}, '계산 순도: '), p ? fmt(p.value) + ' %' : '— (주성분을 선택하세요)', p ? h('span', { class: 'small' }, `  (주성분 ${mains().join('+')} / 정량 성분 합계 ${fmt(r.total_reported, 3)} %)`) : null),
+        h('div', {}, h('b', {}, '순도 (Metal basis): '), p ? fmt(p.value) + ' %' : '— (주성분을 선택하세요)'),
+        p ? h('table', { class: 'tbl small', style: { maxWidth: '760px', margin: '6px 0' } },
+          h('tr', {}, h('td', {}, `주성분 (${mains().join('+')})`), h('td', { class: 'num' }, fmt(pb.main_sum, 4)), h('td', { class: 'muted' }, '성적서 값 그대로 (수정하면 “추출→수정”으로 기록)')),
+          h('tr', {}, h('td', {}, '금속 불순물 합계'), h('td', { class: 'num' }, fmt(pb.impurity_sum, 4)), h('td', { class: 'muted' }, (pb.metal_impurities || []).map((c) => `${c.component} ${c.pct}`).join(', ') || '없음')),
+          h('tr', {}, h('td', {}, '전체 금속량'), h('td', { class: 'num' }, fmt(pb.total_metal, 4)), h('td', { class: 'muted' }, '주성분 + 금속 불순물')),
+          h('tr', {}, h('td', {}, '제외 (비금속)'), h('td', { class: 'num' }, fmt((pb.excluded || []).reduce((a, c) => a + c.pct, 0), 4)), h('td', { class: 'muted' }, (pb.excluded || []).map((c) => `${c.component} ${c.pct}`).join(', ') || '없음'))) : null,
         rec.values.main_auto ? h('div', { class: 'small flag' }, `주성분 ${rec.values.main_auto_reason || '자동 선택'} — 맞는지 확인하세요 (주성분 칸을 바꾸면 사용자 선택으로 기록됩니다).`) : null,
-        h('div', { class: 'small' }, C.XRF_PURITY_FORMULA),
+        h('div', { class: 'small' }, p ? p.formula : C.XRF_PURITY_FORMULA, help('제외하는 비금속 원소: ' + PS.xrfOpts(cfg).exclude.join(', ') + '\n준금속(B, Si, Ge, As, Sb, Te)은 금속 불순물로 포함합니다.')),
         r.non_quantified.length ? h('div', { class: 'small' }, '정량되지 않은 성분: ', r.non_quantified.map((c) => `${c.component}(${C.XRF_STATUS[c.status] || c.status})`).join(', '), ' — 합계·비교에서 0 으로 쓰지 않습니다.') : null,
         h('table', { class: 'tbl', style: { marginTop: '6px', maxWidth: '700px' } }, h('tr', {}, h('th', {}, '관심 원소'), h('th', { class: 'num' }, '함량 (wt%)'), h('th', {}, '근거')),
           rec.values.interest_elements.map((el) => {
@@ -878,6 +1000,7 @@
       const built = PS.xrfRecord(rep, cfg, { interest_elements: rec.values.interest_elements });
       comps.length = 0; comps.push(...built.values.components);
       Object.assign(rec.values, { main_components: built.values.main_components, main_auto: built.values.main_auto, main_auto_reason: built.values.main_auto_reason, report: built.values.report });
+      Object.assign(rec.conditions, built.conditions); ctx.renderConditions && ctx.renderConditions();
       ctx.setSource({ method: meta.method, file_name: meta.file_name || null, edited: false, report_format: rep.format, report_sample: rep.meta.sample_name || null });
       const dates = (rep.meta.date_analyzed ? [{ date: rep.meta.date_analyzed.date, context: `성적서 Date analyzed ${rep.meta.date_analyzed_raw}` }] : []).concat(meta.date_candidates || []);
       ctx.applyFileDates(Object.assign({}, meta, { date_candidates: dates, file_name: meta.file_name ? `${meta.file_name} (Date analyzed)` : '성적서' }));
@@ -890,9 +1013,8 @@
       h('div', { class: 'row', style: { marginTop: '8px' } }, h('label', {}, '관심 불순물 원소', help('산화물(SiO2, Na2O 등)로 보고된 경우 원소 질량분율로 환산하고 환산식을 함께 기록합니다.')), intIn), resBox),
       afterMount() { renderMeta(); renderTbl(); },
       collect() {
-        const r = C.computeXrf(comps, mains(), rec.values.interest_elements);
-        return { values: rec.values, computed: { metrics: r.metrics, details: { total_quantified: r.total_reported, impurities: r.impurities, not_reported: r.not_reported, non_quantified: r.non_quantified,
-          formula: C.XRF_PURITY_FORMULA, main_selection: rec.values.main_auto ? `자동 선택: ${rec.values.main_auto_reason}` : '설정/사용자 선택' } } };
+        const r = C.computeXrf(comps, mains(), rec.values.interest_elements, PS.xrfOpts(cfg));
+        return { values: rec.values, computed: { metrics: r.metrics, details: PS.xrfDetails(r, rec.values.main_auto ? `자동 선택: ${rec.values.main_auto_reason}` : '설정/사용자 선택') } };
       },
     };
   };

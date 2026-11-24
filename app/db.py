@@ -194,6 +194,48 @@ def seed_v1(conn):
                      (k, json.dumps(v, ensure_ascii=False)))
 
 
+BET_V2_FIELDS = [
+    _f("single_point_sa", "단일점 비표면적", "m²/g", "보고서의 Single point surface area (해당 P/Po 기록)"),
+    _f("tplot_micro_volume", "t-plot 미세기공 부피", "cm³/g", "t-plot 으로 구한 미세기공 부피"),
+    _f("bjh_ads_volume", "BJH 흡착 누적 기공 부피", "cm³/g", "BJH Adsorption cumulative volume (보고서의 직경 범위 기준)"),
+    _f("bjh_des_volume", "BJH 탈착 누적 기공 부피", "cm³/g", "BJH Desorption cumulative volume"),
+    _f("bjh_ads_pore_size", "BJH 흡착 평균 기공 직경", "nm", "BJH Adsorption average pore diameter (4V/A)"),
+    _f("hk_max_volume", "HK 최대 기공 부피", "cm³/g", "Horvath–Kawazoe 최대 기공 부피 (미세기공)"),
+    _f("hk_median_width", "HK 중간 기공 폭", "nm", "Horvath–Kawazoe median pore width"),
+]
+BET_V2_METRICS = BET_V2_FIELDS + [
+    _f("micro_area_ratio", "미세기공 면적 비율", "%", "t-plot 미세기공 면적 / BET 비표면적 × 100 (앱 계산)"),
+    _f("bet_c_report", "BET C (보고서)", "", "보고서 BET 계산의 C 값", 1),
+]
+NONMETALS = ["H", "He", "C", "N", "O", "F", "Ne", "P", "S", "Cl", "Ar", "Se", "Br", "Kr", "I", "Xe"]
+
+
+def seed_v2(conn):
+    """BET 항목 추가, XRF Metal basis 설정. 기존 정의는 보존하고 없는 키만 덧붙인다."""
+    r = conn.execute("SELECT config_json FROM analysis_types WHERE code='BET'").fetchone()
+    if r:
+        cfg = json.loads(r[0])
+        for key, extra in (("fields", BET_V2_FIELDS), ("metrics", BET_V2_METRICS)):
+            have = {x["key"] for x in cfg.get(key, [])}
+            cfg.setdefault(key, []).extend(x for x in extra if x["key"] not in have)
+        for key in ("fields", "metrics"):  # 부피(cm³/g)는 소수 넷째 자리로 표시
+            for f in cfg.get(key, []):
+                if f.get("unit") == "cm³/g":
+                    f["decimals"] = 4
+        cfg.setdefault("default_conditions", {}).setdefault("degas", {"value": "", "unit": "", "label": "전처리(탈기) 조건"})
+        conn.execute("UPDATE analysis_types SET config_json=? WHERE code='BET'", (json.dumps(cfg, ensure_ascii=False),))
+    r = conn.execute("SELECT config_json FROM analysis_types WHERE code='XRF'").fetchone()
+    if r:
+        cfg = json.loads(r[0])
+        cfg.setdefault("purity_basis", "metal")
+        cfg.setdefault("metal_basis_exclude", NONMETALS)
+        for m in cfg.get("metrics", []):
+            if m.get("key") == "purity":
+                m["label"] = "순도 (Metal basis)"
+                m["help"] = "주성분 / (주성분 + 금속 불순물 합) × 100. Cl·I·S 등 비금속 원소는 제외"
+        conn.execute("UPDATE analysis_types SET config_json=? WHERE code='XRF'", (json.dumps(cfg, ensure_ascii=False),))
+
+
 def _read_sql(name):
     with open(os.path.join(MIGRATION_DIR, name), encoding="utf-8") as f:
         return f.read()
@@ -202,6 +244,7 @@ def _read_sql(name):
 # (버전, 설명, SQL 파일, 후처리 함수)
 MIGRATIONS = [
     (1, "초기 스키마", "001_initial.sql", seed_v1),
+    (2, "BET 항목 확장 · XRF Metal basis 순도 설정", "002_bet_xrf_config.sql", seed_v2),
 ]
 LATEST_VERSION = MIGRATIONS[-1][0]
 

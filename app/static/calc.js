@@ -238,6 +238,128 @@
     return out;
   };
 
+  // Micromeritics MicroActive (TriStar II 등) 전체 보고서
+  C.parseKoDateTime = function (raw) {
+    const t = String(raw || '');
+    const m = t.match(/(\d{4})\s*[-./]\s*(\d{1,2})\s*[-./]\s*(\d{1,2})/) || t.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+    if (!m) return null;
+    const [y, mo, d] = m[1].length === 4 ? [m[1], m[2], m[3]] : [m[3], m[1], m[2]];
+    const tm = t.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+    let hh = tm ? +tm[1] : null;
+    if (hh !== null && /오후|PM/i.test(t) && hh < 12) hh += 12;
+    if (hh !== null && /오전|AM/i.test(t) && hh === 12) hh = 0;
+    return { date: `${y}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`, time: hh !== null ? `${String(hh).padStart(2, '0')}:${tm[2]}${tm[3] ? ':' + tm[3] : ''}` : null, raw: t.trim() };
+  };
+  C.parseMicroActive = function (text) {
+    const T = String(text || '');
+    if (!/Micromeritics/i.test(T) || !/Isotherm|BET Surface Area/i.test(T)) return null;
+    const g = (rx) => { const m = T.match(rx); return m ? m : null; };
+    const val = (rx, unit, i) => { const m = g(rx); if (!m) return null; const v = C.num(m[i || 1]); return C.isNum(v) ? { value: v, unit, source: 'extracted', evidence: m[0].replace(/\s+/g, ' ').trim().slice(0, 180) } : null; };
+    const field = (label) => { const m = T.match(new RegExp('(?:^|\\s)' + label + ':[ \\t]*(.*?)[ \\t]*(?=\\s(?:Analysis adsorptive|Analysis bath temp\\.|Thermal correction|Ambient free space|Port volume|Low pressure dose|Automatic degas):|$)', 'm')); return m ? m[1].trim() : ''; };
+    const fm = T.match(/File:\s*([\s\S]*?)\n(?=Started:)/);
+    const meta = {
+      format: 'Micromeritics MicroActive 보고서',
+      instrument: (g(/MicroActive[^\n]*?(?=\s+Page|\n)/) || [''])[0].trim(), serial: (g(/Serial #[^\n]*/) || [''])[0].trim(),
+      sample_name: field('Sample'), operator: field('Operator'), submitter: field('Submitter'), file: fm ? fm[1].replace(/\s*\n\s*/g, '').trim() : '',
+      started: C.parseKoDateTime(field('Started')), completed: C.parseKoDateTime(field('Completed')), report_time: C.parseKoDateTime(field('Report time')),
+      adsorptive: field('Analysis adsorptive'), bath_temp: field('Analysis bath temp\\.'), thermal_correction: field('Thermal correction'),
+      sample_mass: field('Sample mass'), ambient_free_space: field('Ambient free space'), analysis_free_space: field('Analysis free space'),
+      equilibration: field('Equilibration interval'), sample_density: field('Sample density'), automatic_degas: field('Automatic degas'),
+    };
+    const nm = (v) => (v ? Object.assign(v, /Å/.test(v.evidence) ? { value: v.value / 10, original: { value: v.value, unit: 'Å' }, conversion: 'nm = Å / 10', unit: 'nm' } : {}) : null);
+    const values = {
+      bet_ssa: val(/BET Surface Area:\s*([\d.]+)/i, 'm²/g'),
+      single_point_sa: val(/Single point surface area at P\/Po = ([\d.]+):\s*([\d.]+)/i, 'm²/g', 2),
+      tplot_micro_area: val(/t-Plot Micropore Area:\s*([\d.]+)/i, 'm²/g'),
+      tplot_ext_area: val(/t-Plot external surface area:\s*([\d.]+)/i, 'm²/g'),
+      pore_volume: val(/total pore volume of pores\s*\n?\s*less than [\d.]+ \S+ diameter at P\/Po = [\d.]+:\s*([\d.]+)/i, 'cm³/g'),
+      tplot_micro_volume: val(/t-Plot micropore volume:\s*([\d.]+)/i, 'cm³/g'),
+      bjh_ads_volume: val(/BJH Adsorption cumulative volume of pores\s*\n?\s*between [\d.]+ \S+ and [\d.]+ \S+ diameter:\s*([\d.]+)/i, 'cm³/g'),
+      bjh_des_volume: val(/BJH Desorption cumulative volume of pores\s*\n?\s*between [\d.]+ \S+ and [\d.]+ \S+ diameter:\s*([\d.]+)/i, 'cm³/g'),
+      pore_size: nm(val(/Adsorption average pore (?:diameter|width) \(4V\/A by BET\):\s*([\d.]+)\s*(?:nm|Å)/i, 'nm')),
+      bjh_ads_pore_size: nm(val(/BJH Adsorption average pore (?:diameter|width) \(4V\/A\):\s*([\d.]+)\s*(?:nm|Å)/i, 'nm')),
+      hk_max_volume: val(/Maximum pore volume at P\/Po = [\d.]+:\s*([\d.]+)/i, 'cm³/g'),
+      hk_median_width: nm(val(/Median pore width:\s*([\d.]+)\s*(?:nm|Å)/i, 'nm')),
+    };
+    for (const k of Object.keys(values)) if (!values[k]) delete values[k];
+    const spP = g(/Single point surface area at P\/Po = ([\d.]+)/i), tpvP = g(/diameter at P\/Po = ([\d.]+):\s*[\d.]+\s*cm/i);
+    if (values.single_point_sa && spP) values.single_point_sa.p_po = C.num(spP[1]);
+    if (values.pore_volume && tpvP) values.pore_volume.p_po = C.num(tpvP[1]);
+    // BET Report 블록
+    const bet = {};
+    const bm = (k, rx) => { const m = g(rx); if (m) { bet[k] = C.num(m[1]); if (m[2]) bet[k + '_err'] = C.num(m[2]); } };
+    bm('ssa', /BET surface area:\s*([\d.]+)\s*±\s*([\d.]+)/i); bm('slope', /Slope:\s*([\d.]+)\s*±\s*([\d.]+)\s*g\/cm/i); bm('intercept', /Y-intercept:\s*([-\d.]+)\s*±\s*([\d.]+)\s*g\/cm/i);
+    bm('C', /(?:^|\n)C:\s*([\d.]+)/); bm('qm', /Qm:\s*([\d.]+)/); bm('corr', /BET Report[\s\S]*?Correlation coefficient:\s*([\d.]+)/i); bm('cross_section_nm2', /Molecular cross-sectional area:\s*([\d.]+)/i);
+    const bi = T.indexOf('1/[Q(Po/P - 1)]');
+    if (bi >= 0) {
+      const pts = [];
+      for (const line of T.slice(bi).split(/\r?\n/).slice(1)) {
+        const m = line.trim().match(/^([\d.]+)\s+([\d.]+)\s+([\d.]+)$/);
+        if (m) pts.push([C.num(m[1]), C.num(m[2])]); else if (pts.length) break;
+      }
+      if (pts.length) { bet.points = pts; bet.range = [pts[0][0], pts[pts.length - 1][0]]; bet.n = pts.length; }
+    }
+    if (C.isNum(bet.corr)) bet.r2 = bet.corr * bet.corr;
+    // t-Plot
+    const tplot = {};
+    const tm2 = g(/Thickness range:\s*([\d.]+)\s*to\s*([\d.]+)\s*(nm|Å)/i);
+    if (tm2) tplot.thickness_range = [C.num(tm2[1]), C.num(tm2[2]), tm2[3]];
+    const te = g(/Thickness equation:\s*([^\n]+)/i); if (te) tplot.equation = te[1].trim();
+    const tc = g(/t-Plot Report[\s\S]*?Correlation coefficient:\s*([\d.]+)/i); if (tc) tplot.corr = C.num(tc[1]);
+    // 등온선 표 (흡착 → 탈착 순서 그대로)
+    const iso = { p: [], q: [], pabs: [], po: [], time: [] };
+    for (const line of T.split(/\r?\n/)) {
+      const m = line.trim().match(/^(\d?\.\d+|1\.0+)\s+([\d.]+)\s+([\d.]+)\s+(\d{1,3}:\d{2})\s+([\d.]+)$/);
+      if (!m) continue;
+      iso.p.push(C.num(m[1])); iso.pabs.push(C.num(m[2])); iso.q.push(C.num(m[3])); iso.time.push(m[4]); iso.po.push(C.num(m[5]));
+    }
+    let turn = iso.p.length;
+    for (let i = 1; i < iso.p.length; i++) if (iso.p[i] < iso.p[i - 1] - 1e-6) { turn = i; break; }
+    iso.n_ads = turn; iso.n_des = iso.p.length - turn;
+    return { format: meta.format, meta, values, bet_report: bet, tplot, isotherm: iso };
+  };
+
+  // 분석기관 결과표 (예: 케이코어솔루션 “시험분석결과” 표: 시료명 + 숫자 열)
+  C.BET_SUMMARY_COLS = [
+    [/BET\s*Surface/i, 'bet_ssa', 'm²/g'], [/BJH\s*Adsorption/i, 'bjh_ads_volume', 'cm³/g'], [/BJH\s*Desorption/i, 'bjh_des_volume', 'cm³/g'],
+    [/Total\s*pore/i, 'pore_volume', 'cm³/g'], [/Horvath/i, 'hk_max_volume', 'cm³/g'], [/Micropore\s*Area/i, 'tplot_micro_area', 'm²/g'],
+    [/External/i, 'tplot_ext_area', 'm²/g'], [/Average\s*pore/i, 'pore_size', 'nm'],
+  ];
+  C.parseBetSummary = function (text) {
+    const T = String(text || '');
+    const hi = T.search(/Sample\s+BET\s*Surface/i);
+    if (hi < 0) return null;
+    const lines = T.slice(hi).split(/\r?\n/);
+    // 헤더: 숫자 행이 나오기 전까지의 줄
+    const head = [];
+    let k = 0;
+    for (; k < lines.length; k++) { if (/\s\d+\.\d+\s+\d+\.\d+/.test(' ' + lines[k])) break; head.push(lines[k]); }
+    const ht = head.join(' ');
+    const cols = C.BET_SUMMARY_COLS.map(([rx, key, unit]) => ({ key, unit, at: ht.search(rx) })).filter((c) => c.at >= 0).sort((a, b) => a.at - b.at);
+    if (!cols.length) return null;
+    const rows = [];
+    const rx = new RegExp('^(.+?)\\s+' + cols.map(() => '([\\d.]+)').join('\\s+') + '\\s*$');
+    for (; k < lines.length; k++) {
+      const m = lines[k].trim().match(rx);
+      if (!m) { if (rows.length && lines[k].trim()) break; continue; }
+      const values = {};
+      cols.forEach((c, i) => { const v = C.num(m[i + 2]); if (C.isNum(v)) values[c.key] = { value: v, unit: c.unit, source: 'extracted', evidence: lines[k].trim() }; });
+      rows.push({ sample: m[1].trim(), values });
+    }
+    const f = (rx2) => { const m = T.match(rx2); return m ? m[1].trim() : ''; };
+    const meta = {
+      format: 'BET 분석 결과표', lab: /케이코어솔루션/.test(T) ? '케이코어솔루션' : f(/^\s*(\S+)\s*\n\s*장\s*비\s*명/m),
+      instrument: f(/장\s*비\s*명\s*:\s*([^\n]+)/), doc_no: f(/문서번호\s*:\s*([^\n]+)/), completed_raw: f(/완료일자\s*:\s*([^\n]+)/),
+      degas: f(/Sampling\s*\n\s*([^\n]+)/), adsorptive: f(/Adsorption Gas\s*:\s*([^\n]+)/), equilibration: f(/Equilibration Interval\s*:\s*([^\n]+)/),
+      fitting_range: f(/BET Fitting Range P\/Po\s*:\s*([^\n]+)/), columns: cols.map((c) => c.key),
+    };
+    const cm = meta.completed_raw.match(/(\d{4})\D+(\d{1,2})\D+(\d{1,2})/);
+    meta.completed = cm ? `${cm[1]}-${cm[2].padStart(2, '0')}-${cm[3].padStart(2, '0')}` : null;
+    const fr = meta.fitting_range.match(/([\d.]+)\s*[–~-]\s*([\d.]+)/);
+    meta.fitting_range_num = fr ? [C.num(fr[1]), C.num(fr[2])] : null;
+    return { format: meta.format, meta, rows };
+  };
+
   // 등온선 데이터: p/p0, 흡착량(cm³/g STP)
   C.BET_SSA_FACTOR = 6.02214076e23 * 0.162e-18 / 22414; // m²/cm³(STP)  ≈ 4.3525
   C.BET_FORMULA = '1/[Q(p0/p − 1)] = (C−1)/(Qm·C)·(p/p0) + 1/(Qm·C);  Qm = 1/(기울기+절편), C = 1 + 기울기/절편, S = Qm × N_A × σ(N₂, 0.162 nm²) / 22414';
@@ -365,6 +487,10 @@
       rows.push(Object.assign({ component: r.component, value: v.value, status: v.status, unit: normUnit(r.unit_raw), source: 'extracted', line_text: line.trim().slice(0, 160) },
         r.det_limit !== undefined ? { det_limit: r.det_limit, el_line: r.line, intensity: r.intensity, wo_normal: r.wo_normal } : {}, { row_no: r.no }));
     }
+    // 필름 보정: “Sample film corr.” 칸에 필름 이름(예: P.E.2.5u(N))이 있으면 보정함
+    const fc = meta.film_correction;
+    meta.film_corrected = !!fc && !/^(none|no|off|없음|-+)$/i.test(fc);
+    meta.film_label = meta.film_corrected ? `있음 (${fc})` : '없음';
     const q = rows.filter((x) => x.status === 'quantified');
     meta.result_sum = q.reduce((a, x) => a + (x.unit === 'ppm' ? x.value / 1e4 : x.value), 0);
     const wo = rows.filter((x) => C.isNum(x.wo_normal));
@@ -415,17 +541,35 @@
     return { list: [], auto: false };
   };
 
-  C.XRF_PURITY_FORMULA = '순도(%) = Σ(주성분 함량) / Σ(정량된 모든 성분 함량) × 100   (Trace·불검출 성분은 합계에서 제외)';
-  C.computeXrf = function (components, mainList, interest) {
+  // Metal basis 순도에서 빼는 비금속 원소 (준금속 B·Si·Ge·As·Sb·Te 는 금속 불순물로 포함)
+  C.NONMETALS = ['H', 'He', 'C', 'N', 'O', 'F', 'Ne', 'P', 'S', 'Cl', 'Ar', 'Se', 'Br', 'Kr', 'I', 'Xe'];
+  C.XRF_PURITY_FORMULA = 'Purity(Metal basis, %) = 주성분 / (주성분 + Σ금속 불순물) × 100   (비금속 원소·Trace·불검출은 제외)';
+  C.XRF_PURITY_FORMULA_TOTAL = '순도(%) = Σ(주성분 함량) / Σ(정량된 모든 성분 함량) × 100';
+  C.computeXrf = function (components, mainList, interest, opts) {
+    opts = Object.assign({ basis: 'metal', exclude: C.NONMETALS }, opts || {});
     const isQ = (c) => (c.status === undefined || c.status === 'quantified') && C.isNum(c.value);
     const pct = components.filter(isQ).map((c) => ({ ...c, pct: c.unit === 'ppm' ? c.value / 1e4 : c.value }));
     const total = pct.reduce((s, c) => s + c.pct, 0);
     const mains = pct.filter((c) => mainList.includes(c.component));
     const metrics = {};
-    if (mains.length && total > 0) {
-      const mainSum = mains.reduce((s, c) => s + c.pct, 0);
-      metrics.purity = { value: (mainSum / total) * 100, unit: '%', formula: C.XRF_PURITY_FORMULA,
-        inputs: { main: mains.map((c) => `${c.component}=${c.pct}`), total_quantified: total } };
+    // 화합물(예: SiO2)은 구성 원소 중 비금속이 아닌 원소가 있으면 금속 불순물로 본다
+    const isExcluded = (comp) => { const f = C.parseFormula(comp); return !f || Object.keys(f).every((e) => opts.exclude.includes(e)); };
+    const others = pct.filter((c) => !mainList.includes(c.component));
+    const metalImp = others.filter((c) => !isExcluded(c.component));
+    const excluded = others.filter((c) => isExcluded(c.component));
+    const mainSum = mains.reduce((s, c) => s + c.pct, 0);
+    const impSum = metalImp.reduce((s, c) => s + c.pct, 0);
+    const purity = {};
+    if (mains.length) {
+      if (opts.basis === 'total' && total > 0) {
+        metrics.purity = { value: (mainSum / total) * 100, unit: '%', formula: C.XRF_PURITY_FORMULA_TOTAL, inputs: { main: mains.map((c) => `${c.component}=${c.pct}`), total_quantified: total } };
+      } else if (mainSum + impSum > 0) {
+        metrics.purity = { value: (mainSum / (mainSum + impSum)) * 100, unit: '%', formula: C.XRF_PURITY_FORMULA,
+          inputs: { main: mains.map((c) => `${c.component}=${c.pct}`), main_sum: mainSum, metal_impurities: metalImp.map((c) => `${c.component}=${c.pct}`), impurity_sum: impSum,
+            total_metal: mainSum + impSum, excluded: excluded.map((c) => `${c.component}=${c.pct}`), excluded_rule: '비금속 원소: ' + opts.exclude.join(', ') } };
+      }
+      Object.assign(purity, { basis: opts.basis, main_sum: mainSum, impurity_sum: impSum, total_metal: mainSum + impSum, metal_impurities: metalImp.map((c) => ({ component: c.component, pct: c.pct })),
+        excluded: excluded.map((c) => ({ component: c.component, pct: c.pct })) });
     }
     const impurities = {};
     const nonQ = components.filter((c) => !isQ(c));
@@ -443,7 +587,7 @@
       }
       if (impurities[el] && C.isNum(impurities[el].value)) metrics['imp_' + el] = { value: impurities[el].value, unit: 'wt%', formula: impurities[el].basis, inputs: {} };
     }
-    return { metrics, total_reported: total, impurities, main_components: mainList, interest_elements: interest,
+    return { metrics, total_reported: total, purity, impurities, main_components: mainList, interest_elements: interest,
       not_reported: interest.filter((el) => !impurities[el]), non_quantified: nonQ.map((c) => ({ component: c.component, status: c.status })) };
   };
 
@@ -729,7 +873,9 @@
     if (v === null || v === undefined || v === '' || (typeof v === 'number' && !Number.isFinite(v))) return '—';
     if (typeof v !== 'number') { const n = Number(v); if (!Number.isFinite(n)) return String(v); v = n; }
     d = d === undefined ? 2 : d;
-    if (v !== 0 && Math.abs(v) < Math.pow(10, -d) * 5) return v.toExponential(2);
+    if (v !== 0 && Math.abs(v) < 1e-4) return v.toExponential(2);
+    // 기본 자릿수로 반올림하면 정보가 사라지는 작은 값(예: 0.0272 cm³/g)은 유효숫자 3자리로 보여준다
+    if (v !== 0 && Math.abs(v) < Math.pow(10, -d) * 5) return Number(v.toPrecision(3)).toString();
     return v.toLocaleString('ko-KR', { minimumFractionDigits: d, maximumFractionDigits: d });
   };
 
